@@ -6,8 +6,10 @@ import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanFilter;
 import android.bluetooth.le.ScanRecord;
 import android.bluetooth.le.ScanResult;
+import android.bluetooth.le.ScanSettings;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
@@ -44,7 +46,7 @@ import io.dcloud.feature.uniapp.common.UniModule;
 
 public class RdbbBleEspProvisioningModule extends UniModule {
 
-    private static final String EVENT_NAME = "rdbbEspEvent";
+    private static final String EVENT_NAME = "espEvent";
 
     private static final int REQUEST_CODE_PERMISSIONS = 41001;
     private static final int REQUEST_CODE_ENABLE_BLUETOOTH = 41002;
@@ -52,171 +54,216 @@ public class RdbbBleEspProvisioningModule extends UniModule {
     private static final int ACTION_NONE = 0;
     private static final int ACTION_SCAN = 1;
     private static final int ACTION_CONNECT = 2;
-    private static final int ACTION_INIT_SESSION = 3;
+    private static final int ACTION_SCAN_WIFI = 3;
+    private static final int ACTION_PROVISION = 4;
+
+    public static final int CODE_SUCCESS = 0;
+    public static final int CODE_ENV_EXISTS = 1;
+    public static final int CODE_NOT_INITIALIZED = 2;
+    public static final int CODE_SCAN_STOPPED = 3;
+    public static final int CODE_SCAN_RUNNING = 4;
+    public static final int CODE_WIFI_SCAN_NOT_SUPPORTED = 5;
+    public static final int CODE_DEVICE_NOT_CONNECTED = 6;
+    public static final int CODE_PARAM_ERROR = 7;
+    public static final int CODE_INIT_SESSION_FAILED = 8;
+    public static final int CODE_RESERVED = 9;
+    public static final int CODE_ENV_CHECK_OK = 10;
+    public static final int CODE_LOCATION_DISABLED = 11;
+    public static final int CODE_GPS_DISABLED = 12;
+    public static final int CODE_BLE_NOT_SUPPORTED = 13;
+    public static final int CODE_BLE_NEED_ENABLE = 14;
+    public static final int CODE_LOCATION_PERMISSION_REQUIRED = 15;
+    public static final int CODE_LOCATION_PERMISSION_DENIED = 16;
+    public static final int CODE_LOCATION_PERMISSION_REQUIRED_2 = 17;
+    public static final int CODE_CONNECTING = 18;
+    public static final int CODE_ALREADY_CONNECTED = 19;
+    public static final int CODE_PROVISIONING = 20;
+    public static final int CODE_BLE_PERMISSION_REQUIRED = 21;
+    public static final int CODE_BLE_PERMISSION_REQUESTED = 22;
 
     private static final int DEFAULT_SCAN_TIMEOUT_MS = 10000;
     private static final int DEFAULT_CONNECT_TIMEOUT_MS = 15000;
     private static final int DEFAULT_SESSION_TIMEOUT_MS = 10000;
-    private static final int DEFAULT_RETRY_DELAY_MS = 1500;
+    private static final int DEFAULT_PROVISION_TIMEOUT_MS = 60000;
+    private static final int DEFAULT_RETRY_DELAY_MS = 1200;
     private static final int DEFAULT_MAX_CONNECT_RETRIES = 1;
     private static final int DEFAULT_MAX_SESSION_RETRIES = 1;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
-    private final Runnable scanTimeoutRunnable = this::handleScanTimeout;
-    private final Runnable connectTimeoutRunnable = this::handleConnectTimeout;
-    private final Runnable sessionTimeoutRunnable = this::handleSessionTimeout;
-
-    private ESPProvisionManager provisionManager;
-    private ESPDevice espDevice;
+    private final Runnable scanTimeoutRunnable = this::onScanTimeout;
+    private final Runnable connectTimeoutRunnable = this::onConnectTimeout;
+    private final Runnable sessionTimeoutRunnable = this::onSessionTimeout;
+    private final Runnable provisionTimeoutRunnable = this::onProvisionTimeout;
 
     private Context appContext;
     private WeakReference<Activity> activityRef = new WeakReference<>(null);
 
+    private ESPProvisionManager provisionManager;
+    private ESPDevice espDevice;
+
     private BluetoothLeScanner scanner;
     private ScanCallback scanCallback;
 
-    private final Map<String, ScanResult> devices = new HashMap<>();
-
-    private String devicePrefix = "PROV_";
-    private String deviceName = "";
-    private String primaryServiceUuid = "";
-    private String pop = "";
-
-    private int securityType = 1;
-
-    private int defaultConnectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS;
-    private int defaultSessionTimeoutMs = DEFAULT_SESSION_TIMEOUT_MS;
-    private int defaultConnectRetries = DEFAULT_MAX_CONNECT_RETRIES;
-    private int defaultSessionRetries = DEFAULT_MAX_SESSION_RETRIES;
-    private int retryDelayMs = DEFAULT_RETRY_DELAY_MS;
+    private final Map<String, ScanResult> scannedResults = new HashMap<>();
 
     private int pendingAction = ACTION_NONE;
-    private JSONObject pendingActionData;
+    private Object pendingActionData;
 
-    private boolean scanning = false;
-    private boolean connectionInProgress = false;
-    private boolean sessionInProgress = false;
-    private boolean deviceConnected = false;
-    private boolean sessionInitialized = false;
-    private boolean userInitiatedDisconnect = false;
-    private boolean autoDisconnectAfterProvision = false;
+    private String devicePrefix = "";
+    private String configuredServiceUuid = "";
+    private String connectedAddress = "";
+    private String connectedName = "";
+    private String connectedServiceUuid = "";
+    private String pop = "";
+    private String disconnectReason = "remote";
 
-    private String connectAddress = "";
-    private String connectPop = "";
-    private String connectServiceUuid = "";
-
-    private int connectSecurityType = 1;
-    private int connectAttempt = 0;
+    private int securityType = 1;
+    private int scanTimeoutMs = DEFAULT_SCAN_TIMEOUT_MS;
     private int connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS;
-    private int connectRetriesRemaining = DEFAULT_MAX_CONNECT_RETRIES;
-
-    private int sessionAttempt = 0;
     private int sessionTimeoutMs = DEFAULT_SESSION_TIMEOUT_MS;
+    private int provisionTimeoutMs = DEFAULT_PROVISION_TIMEOUT_MS;
+    private int retryDelayMs = DEFAULT_RETRY_DELAY_MS;
+    private int connectRetriesRemaining = DEFAULT_MAX_CONNECT_RETRIES;
     private int sessionRetriesRemaining = DEFAULT_MAX_SESSION_RETRIES;
+    private int connectAttempt = 0;
+    private int sessionAttempt = 0;
+
+    private long provisionTaskId = 0;
+
+    private boolean initialized = false;
+    private boolean scanning = false;
+    private boolean connecting = false;
+    private boolean connected = false;
+    private boolean sessionInitializing = false;
+    private boolean sessionInitialized = false;
+    private boolean provisioning = false;
+    private boolean autoDisconnectAfterProvision = false;
 
     private Runnable pendingConnectRetryRunnable;
     private Runnable pendingSessionRetryRunnable;
 
     @UniJSMethod(uiThread = true)
-    public void init(JSONObject options) {
-        refreshActivityReference();
+    public int bleEnvironmentOnLoad(JSONObject options) {
+        refreshContext();
 
-        Context context = getUniContext();
-        appContext = context == null ? null : context.getApplicationContext();
-
-        if (appContext == null && activityRef.get() != null) {
-            appContext = activityRef.get().getApplicationContext();
+        int configCode = updateConfig(options);
+        if (configCode != CODE_SUCCESS) {
+            emitCode("bleEnvironmentInit", configCode, simpleEvent("message", "config error"));
+            return configCode;
         }
 
         if (appContext == null) {
-            emitError("NO_CONTEXT", "DCloud context is null");
-            return;
+            emitCode("bleEnvironmentInit", CODE_NOT_INITIALIZED, simpleEvent("message", "DCloud context is null"));
+            return CODE_NOT_INITIALIZED;
         }
 
-        securityType = getInt(options, "securityType", 1);
-        pop = getString(options, "pop", "");
-        devicePrefix = getString(options, "prefix", "PROV_");
-
-        primaryServiceUuid = getString(options, "serviceUuid", "").trim();
-
-        if (primaryServiceUuid.length() > 0 && !isValidUuid(primaryServiceUuid)) {
-            emitError("INVALID_SERVICE_UUID", "serviceUuid is invalid");
-            return;
+        BluetoothAdapter adapter = getBluetoothAdapter();
+        if (adapter == null) {
+            emitCode("bleEnvironmentInit", CODE_BLE_NOT_SUPPORTED, simpleEvent("message", "BLE not supported"));
+            return CODE_BLE_NOT_SUPPORTED;
         }
 
-        defaultConnectTimeoutMs = sanitizeTimeout(
-                getInt(options, "connectTimeoutMs", DEFAULT_CONNECT_TIMEOUT_MS),
-                DEFAULT_CONNECT_TIMEOUT_MS
-        );
-
-        defaultSessionTimeoutMs = sanitizeTimeout(
-                getInt(options, "sessionTimeoutMs", DEFAULT_SESSION_TIMEOUT_MS),
-                DEFAULT_SESSION_TIMEOUT_MS
-        );
-
-        defaultConnectRetries = sanitizeRetryCount(
-                getInt(options, "maxConnectRetries", DEFAULT_MAX_CONNECT_RETRIES)
-        );
-
-        defaultSessionRetries = sanitizeRetryCount(
-                getInt(options, "maxSessionRetries", DEFAULT_MAX_SESSION_RETRIES)
-        );
-
-        retryDelayMs = sanitizeTimeout(
-                getInt(options, "retryDelayMs", DEFAULT_RETRY_DELAY_MS),
-                DEFAULT_RETRY_DELAY_MS
-        );
-
-        autoDisconnectAfterProvision = getBoolean(options, "autoDisconnectAfterProvision", false);
+        if (initialized && provisionManager != null) {
+            emitCode("bleEnvironmentInit", CODE_ENV_EXISTS, simpleEvent("message", "environment exists"));
+            return CODE_ENV_EXISTS;
+        }
 
         provisionManager = ESPProvisionManager.getInstance(appContext);
+        initialized = provisionManager != null;
+
+        if (!initialized) {
+            emitCode("bleEnvironmentInit", CODE_NOT_INITIALIZED, simpleEvent("message", "ESPProvisionManager init failed"));
+            return CODE_NOT_INITIALIZED;
+        }
 
         if (!EventBus.getDefault().isRegistered(this)) {
             EventBus.getDefault().register(this);
         }
 
-        emit("initialized", put(json(), "serviceUuid", primaryServiceUuid));
+        boolean requestPermissions = getBoolean(options, "isRequestPermissions", true);
+        if (requestPermissions) {
+            int permissionCode = requestPermissionsIfNeeded(ACTION_NONE, null);
+            if (permissionCode != CODE_SUCCESS) {
+                emitCode("bleEnvironmentInit", permissionCode, simpleEvent("message", "permission required"));
+                return permissionCode;
+            }
+        }
+
+        try {
+            if (!adapter.isEnabled()) {
+                emitState("blePermissions", false);
+                requestEnableBluetooth(ACTION_NONE, null);
+                emitCode("bleEnvironmentInit", CODE_BLE_NEED_ENABLE, simpleEvent("message", "bluetooth disabled"));
+                return CODE_BLE_NEED_ENABLE;
+            }
+        } catch (SecurityException e) {
+            int code = permissionCodeByAndroidVersion();
+            emitCode("bleEnvironmentInit", code, messageEvent(e));
+            return code;
+        }
+
+        emitState("blePermissions", true);
+        emitCode("bleEnvironmentInit", CODE_SUCCESS, simpleEvent("message", "environment ready"));
+        return CODE_SUCCESS;
     }
 
     @UniJSMethod(uiThread = true)
-    public void searchESPDevices(JSONObject options) {
-        if (!ensureReady()) return;
+    public int bleEnvironmentOnUnload() {
+        releaseAll(true);
+        emitCode("bleEnvironmentUnload", CODE_SUCCESS);
+        return CODE_SUCCESS;
+    }
 
-        refreshActivityReference();
-
-        devicePrefix = getString(options, "prefix", devicePrefix);
-        primaryServiceUuid = getString(options, "serviceUuid", primaryServiceUuid).trim();
-
-        int timeoutMs = sanitizeTimeout(
-                getInt(options, "timeoutMs", DEFAULT_SCAN_TIMEOUT_MS),
-                DEFAULT_SCAN_TIMEOUT_MS
-        );
-
-        if (primaryServiceUuid.length() > 0 && !isValidUuid(primaryServiceUuid)) {
-            emitError("INVALID_SERVICE_UUID", "serviceUuid is invalid");
-            return;
+    @UniJSMethod(uiThread = true)
+    public int bleStartSearchDevice(String prefix) {
+        if (!initialized || provisionManager == null) {
+            emitCode("bleScanListenerCodeState", CODE_NOT_INITIALIZED);
+            return CODE_NOT_INITIALIZED;
         }
 
-        if (!ensurePermissions(ACTION_SCAN, options)) return;
-        if (!ensureBluetoothEnabled(ACTION_SCAN, options)) return;
+        if (scanning) {
+            emitCode("bleScanListenerCodeState", CODE_SCAN_RUNNING);
+            return CODE_SCAN_RUNNING;
+        }
 
-        stopScanInternal(false);
-        devices.clear();
+        devicePrefix = prefix == null ? "" : prefix.trim();
+
+        int permissionCode = requestPermissionsIfNeeded(ACTION_SCAN, prefix);
+        if (permissionCode != CODE_SUCCESS) {
+            emitCode("bleScanListenerCodeState", permissionCode);
+            return permissionCode;
+        }
+
+        int bluetoothCode = ensureBluetoothEnabled(ACTION_SCAN, prefix);
+        if (bluetoothCode != CODE_SUCCESS) {
+            emitCode("bleScanListenerCodeState", bluetoothCode);
+            return bluetoothCode;
+        }
 
         BluetoothAdapter adapter = getBluetoothAdapter();
-
         if (adapter == null) {
-            emitError("BLE_UNAVAILABLE", "Bluetooth adapter is unavailable");
-            return;
+            emitCode("bleScanListenerCodeState", CODE_BLE_NOT_SUPPORTED);
+            return CODE_BLE_NOT_SUPPORTED;
         }
 
-        scanner = adapter.getBluetoothLeScanner();
-
-        if (scanner == null) {
-            emitError("BLE_SCANNER_NULL", "BluetoothLeScanner is null");
-            return;
+        BluetoothLeScanner leScanner;
+        try {
+            leScanner = adapter.getBluetoothLeScanner();
+        } catch (SecurityException e) {
+            int code = permissionCodeByAndroidVersion();
+            emitCode("bleScanListenerCodeState", code, messageEvent(e));
+            return code;
         }
+
+        if (leScanner == null) {
+            emitCode("bleScanListenerCodeState", CODE_BLE_NOT_SUPPORTED);
+            return CODE_BLE_NOT_SUPPORTED;
+        }
+
+        stopScanInternal(false);
+        scannedResults.clear();
+        scanner = leScanner;
 
         scanCallback = new ScanCallback() {
             @Override
@@ -235,484 +282,327 @@ public class RdbbBleEspProvisioningModule extends UniModule {
             @Override
             public void onScanFailed(int errorCode) {
                 stopScanInternal(false);
-                emitError("BLE_SCAN_FAILED", String.valueOf(errorCode));
+                emitCode("bleScanListenerCodeState", errorCode, simpleEvent("message", "scan failed"));
             }
         };
 
         try {
-            scanner.startScan(scanCallback);
+            List<ScanFilter> filters = buildScanFilters();
+            ScanSettings settings = new ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                    .build();
+
+            if (filters.isEmpty()) {
+                scanner.startScan(scanCallback);
+            } else {
+                scanner.startScan(filters, settings, scanCallback);
+            }
+
             scanning = true;
-
-            emit("scanStart", put(
-                    put(json(), "prefix", devicePrefix),
-                    "timeoutMs", timeoutMs
-            ));
-
             mainHandler.removeCallbacks(scanTimeoutRunnable);
-            mainHandler.postDelayed(scanTimeoutRunnable, timeoutMs);
+            mainHandler.postDelayed(scanTimeoutRunnable, scanTimeoutMs);
 
-        } catch (SecurityException se) {
-            emitError("NO_PERMISSION", se.getMessage());
+            emitCode("bleScanListenerCodeState", 100, simpleEvent("message", "scan started"));
+            return CODE_SUCCESS;
+        } catch (SecurityException e) {
+            int code = permissionCodeByAndroidVersion();
+            emitCode("bleScanListenerCodeState", code, messageEvent(e));
+            return code;
         } catch (Exception e) {
-            emitError("SCAN_EXCEPTION", e.getMessage());
+            emitCode("bleScanListenerCodeState", CODE_PARAM_ERROR, messageEvent(e));
+            return CODE_PARAM_ERROR;
         }
     }
 
-    private void handleScanResult(ScanResult result) {
-        if (result == null || result.getDevice() == null) return;
-
-        String name = resolveDeviceName(result);
-
-        if (name == null || !name.startsWith(devicePrefix)) return;
-
-        String address = result.getDevice().getAddress();
-
-        if (address == null || address.length() == 0) return;
-        if (devices.containsKey(address)) return;
-
-        devices.put(address, result);
-
-        String advServiceUuid = resolvePrimaryServiceUuid(result);
-
-        emit("deviceFound",
-                put(
-                        put(
-                                put(
-                                        put(
-                                                json(),
-                                                "name", name
-                                        ),
-                                        "address", address
-                                ),
-                                "rssi", result.getRssi()
-                        ),
-                        "serviceUuid", advServiceUuid == null ? "" : advServiceUuid
-                )
-        );
-    }
-
     @UniJSMethod(uiThread = true)
-    public JSONObject stopScan(JSONObject ignored) {
+    public int bleStopSearchDevice() {
         stopScanInternal(true);
-        return ok("scan stopped");
+        return CODE_SCAN_STOPPED;
     }
 
     @UniJSMethod(uiThread = true)
-    public void connect(JSONObject data) {
-        if (!ensureReady()) return;
+    public int bleConnectDevice(JSONObject data) {
+        if (!initialized || provisionManager == null) {
+            emitCode("bleConnectCodeState", CODE_NOT_INITIALIZED);
+            return CODE_NOT_INITIALIZED;
+        }
 
-        refreshActivityReference();
+        if (connecting) {
+            emitCode("bleConnectCodeState", CODE_CONNECTING);
+            return CODE_CONNECTING;
+        }
 
-        if (!ensurePermissions(ACTION_CONNECT, data)) return;
-        if (!ensureBluetoothEnabled(ACTION_CONNECT, data)) return;
+        if (connected) {
+            emitCode("bleConnectCodeState", CODE_ALREADY_CONNECTED);
+            return CODE_ALREADY_CONNECTED;
+        }
 
-        String address = getString(data, "address", "");
-        String name = getString(data, "name", "");
+        if (data == null) {
+            emitCode("bleConnectCodeState", CODE_PARAM_ERROR, simpleEvent("message", "data is null"));
+            return CODE_PARAM_ERROR;
+        }
 
+        JSONObject mBleDevice = data.getJSONObject("mBleDevice");
+        if (mBleDevice == null) {
+            emitCode("bleConnectCodeState", CODE_PARAM_ERROR, simpleEvent("message", "mBleDevice is null"));
+            return CODE_PARAM_ERROR;
+        }
+
+        String address = getString(mBleDevice, "address", "");
         if (address.length() == 0) {
-            emitError("ADDRESS_EMPTY", "address is required");
-            return;
+            emitCode("bleConnectCodeState", CODE_PARAM_ERROR, simpleEvent("message", "address is empty"));
+            return CODE_PARAM_ERROR;
         }
 
-        ScanResult sr = devices.get(address);
-
-        if (sr == null) {
-            emitError("DEVICE_NOT_FOUND", "Please call searchESPDevices first and use address from deviceFound");
-            return;
+        ScanResult scanResult = scannedResults.get(address);
+        if (scanResult == null || scanResult.getDevice() == null) {
+            emitCode("bleConnectCodeState", CODE_PARAM_ERROR, simpleEvent("message", "ScanResult not found. Please scan again."));
+            return CODE_PARAM_ERROR;
         }
 
-        int sec = getInt(data, "securityType", securityType);
-        String usePop = getString(data, "pop", pop);
-
-        String requestedServiceUuid = getString(data, "serviceUuid", primaryServiceUuid).trim();
-
-        if (requestedServiceUuid.length() > 0 && !isValidUuid(requestedServiceUuid)) {
-            emitError("INVALID_SERVICE_UUID", "serviceUuid is invalid");
-            return;
+        int permissionCode = requestPermissionsIfNeeded(ACTION_CONNECT, data);
+        if (permissionCode != CODE_SUCCESS) {
+            emitCode("bleConnectCodeState", permissionCode);
+            return permissionCode;
         }
 
-        String scannedServiceUuid = resolvePrimaryServiceUuid(sr);
-        String useServiceUuid = chooseServiceUuid(scannedServiceUuid, requestedServiceUuid);
-
-        if (!isValidUuid(useServiceUuid)) {
-            emitError(
-                    "SERVICE_UUID_MISSING",
-                    "No valid service UUID found. Please make sure the ESP device advertises service UUID or pass serviceUuid manually."
-            );
-            return;
+        int bluetoothCode = ensureBluetoothEnabled(ACTION_CONNECT, data);
+        if (bluetoothCode != CODE_SUCCESS) {
+            emitCode("bleConnectCodeState", bluetoothCode);
+            return bluetoothCode;
         }
 
         stopScanInternal(false);
 
-        connectAddress = address;
-        connectSecurityType = sec;
-        connectPop = usePop;
-        connectServiceUuid = useServiceUuid;
+        securityType = normalizeSecurityType(getInt(data, "securityType", securityType));
+        pop = getString(data, "pop", pop);
 
-        deviceName = name.length() > 0 ? name : resolveDeviceName(sr);
+        connectedAddress = address;
+        connectedName = firstNonEmpty(
+                getString(mBleDevice, "name", ""),
+                getString(mBleDevice, "deviceName", ""),
+                resolveDeviceName(scanResult),
+                "ESP_DEVICE"
+        );
 
-        if (deviceName == null || deviceName.length() == 0) {
-            deviceName = "ESP_DEVICE";
+        String requestedUuid = firstNonEmpty(
+                getString(data, "serviceUuid", ""),
+                getString(mBleDevice, "serviceUuid", ""),
+                getString(mBleDevice, "primaryServiceUuid", ""),
+                configuredServiceUuid
+        );
+
+        if (requestedUuid.length() > 0 && !isValidUuid(requestedUuid)) {
+            emitCode("bleConnectCodeState", CODE_PARAM_ERROR, simpleEvent("message", "Invalid serviceUuid."));
+            return CODE_PARAM_ERROR;
         }
 
-        connectTimeoutMs = sanitizeTimeout(
-                getInt(data, "connectTimeoutMs", defaultConnectTimeoutMs),
-                defaultConnectTimeoutMs
-        );
+        String scannedUuid = resolvePrimaryServiceUuid(scanResult);
+        connectedServiceUuid = chooseServiceUuid(scannedUuid, requestedUuid);
 
-        connectRetriesRemaining = sanitizeRetryCount(
-                getInt(data, "maxConnectRetries", defaultConnectRetries)
-        );
+        if (!isValidUuid(connectedServiceUuid)) {
+            emitCode("bleConnectCodeState", CODE_PARAM_ERROR, simpleEvent("message", "No valid BLE serviceUuid found."));
+            return CODE_PARAM_ERROR;
+        }
 
-        retryDelayMs = sanitizeTimeout(
-                getInt(data, "retryDelayMs", retryDelayMs),
-                retryDelayMs
-        );
+        connectTimeoutMs = sanitizeTimeout(getInt(data, "connectTimeoutMs", connectTimeoutMs), DEFAULT_CONNECT_TIMEOUT_MS);
+        sessionTimeoutMs = sanitizeTimeout(getInt(data, "sessionTimeoutMs", sessionTimeoutMs), DEFAULT_SESSION_TIMEOUT_MS);
+        retryDelayMs = sanitizeTimeout(getInt(data, "retryDelayMs", retryDelayMs), DEFAULT_RETRY_DELAY_MS);
+        connectRetriesRemaining = sanitizeRetryCount(getInt(data, "maxConnectRetries", DEFAULT_MAX_CONNECT_RETRIES));
+        sessionRetriesRemaining = sanitizeRetryCount(getInt(data, "maxSessionRetries", DEFAULT_MAX_SESSION_RETRIES));
 
         connectAttempt = 0;
-        userInitiatedDisconnect = false;
-        deviceConnected = false;
-        sessionInitialized = false;
-
-        startConnectAttempt(sr);
-    }
-
-    private void startConnectAttempt(ScanResult sr) {
-        if (sr == null || sr.getDevice() == null) {
-            connectionInProgress = false;
-            emitError("DEVICE_NOT_FOUND", "Scan result expired, please scan again");
-            return;
-        }
-
-        try {
-            ESPConstants.SecurityType st =
-                    connectSecurityType == 0
-                            ? ESPConstants.SecurityType.SECURITY_0
-                            : ESPConstants.SecurityType.SECURITY_1;
-
-            clearConnectTimeout();
-            clearConnectRetry();
-            clearSessionTimeout();
-            clearSessionRetry();
-
-            disconnectQuietly();
-
-            deviceConnected = false;
-            sessionInitialized = false;
-
-            provisionManager.createESPDevice(
-                    ESPConstants.TransportType.TRANSPORT_BLE,
-                    st
-            );
-
-            espDevice = provisionManager.getEspDevice();
-
-            if (espDevice == null) {
-                connectionInProgress = false;
-                emitError("DEVICE_CREATE_FAILED", "ESPDevice is null");
-                return;
-            }
-
-            espDevice.setDeviceName(deviceName);
-            espDevice.setPrimaryServiceUuid(connectServiceUuid);
-
-            if (connectPop != null && connectPop.length() > 0) {
-                espDevice.setProofOfPossession(connectPop);
-            }
-
-            connectionInProgress = true;
-            connectAttempt++;
-
-            emit("connectStart",
-                    put(
-                            put(
-                                    put(
-                                            put(
-                                                    put(
-                                                            put(
-                                                                    json(),
-                                                                    "name", deviceName
-                                                            ),
-                                                            "address", connectAddress
-                                                    ),
-                                                    "securityType", connectSecurityType
-                                            ),
-                                            "serviceUuid", connectServiceUuid
-                                    ),
-                                    "attempt", connectAttempt
-                            ),
-                            "remainingRetries", connectRetriesRemaining
-                    )
-            );
-
-            espDevice.connectBLEDevice(sr.getDevice(), connectServiceUuid);
-
-            mainHandler.postDelayed(connectTimeoutRunnable, connectTimeoutMs);
-
-        } catch (SecurityException se) {
-            connectionInProgress = false;
-            emitError("NO_PERMISSION", se.getMessage());
-        } catch (Exception e) {
-            handleConnectFailure("CONNECT_EXCEPTION", e.getMessage(), true);
-        }
-    }
-
-    @Subscribe(threadMode = ThreadMode.MAIN)
-    public void onDeviceConnectionEvent(DeviceConnectionEvent event) {
-        if (event == null) return;
-
-        int type = event.getEventType();
-
-        if (type == ESPConstants.EVENT_DEVICE_CONNECTED) {
-            clearConnectTimeout();
-            clearConnectRetry();
-
-            connectionInProgress = false;
-            deviceConnected = true;
-
-            emit("connected",
-                    put(
-                            put(
-                                    put(json(), "name", deviceName),
-                                    "address", connectAddress
-                            ),
-                            "attempt", connectAttempt
-                    )
-            );
-
-        } else if (type == ESPConstants.EVENT_DEVICE_CONNECTION_FAILED) {
-            deviceConnected = false;
-            sessionInitialized = false;
-            handleConnectFailure("CONNECT_FAILED", "Device connection failed", true);
-
-        } else if (type == ESPConstants.EVENT_DEVICE_DISCONNECTED) {
-            clearConnectTimeout();
-            clearConnectRetry();
-            clearSessionTimeout();
-            clearSessionRetry();
-
-            boolean wasUserInitiated = userInitiatedDisconnect;
-
-            connectionInProgress = false;
-            sessionInProgress = false;
-            deviceConnected = false;
-            sessionInitialized = false;
-            userInitiatedDisconnect = false;
-
-            if (wasUserInitiated) {
-                emit("disconnected",
-                        put(
-                                put(json(), "name", deviceName),
-                                "reason", "user"
-                        )
-                );
-            } else {
-                emit("disconnected",
-                        put(
-                                put(json(), "name", deviceName),
-                                "reason", "remote"
-                        )
-                );
-            }
-
-        } else {
-            emit("connectionEvent", put(json(), "type", String.valueOf(type)));
-        }
-    }
-
-    @UniJSMethod(uiThread = true)
-    public void initializeSession(JSONObject data) {
-        if (!ensureConnectedDevice()) return;
-
-        refreshActivityReference();
-
-        if (!ensurePermissions(ACTION_INIT_SESSION, data)) return;
-
-        sessionTimeoutMs = sanitizeTimeout(
-                getInt(data, "sessionTimeoutMs", defaultSessionTimeoutMs),
-                defaultSessionTimeoutMs
-        );
-
-        sessionRetriesRemaining = sanitizeRetryCount(
-                getInt(data, "maxSessionRetries", defaultSessionRetries)
-        );
-
-        retryDelayMs = sanitizeTimeout(
-                getInt(data, "retryDelayMs", retryDelayMs),
-                retryDelayMs
-        );
-
         sessionAttempt = 0;
+        connected = false;
         sessionInitialized = false;
+        disconnectReason = "remote";
 
-        startSessionAttempt();
-    }
-
-    private void startSessionAttempt() {
-        if (!ensureConnectedDevice()) return;
-
-        clearSessionTimeout();
-        clearSessionRetry();
-
-        sessionInProgress = true;
-        sessionAttempt++;
-
-        emit("sessionStart",
-                put(
-                        put(json(), "attempt", sessionAttempt),
-                        "remainingRetries", sessionRetriesRemaining
-                )
-        );
-
-        try {
-            espDevice.initSession(new ResponseListener() {
-                @Override
-                public void onSuccess(byte[] returnData) {
-                    clearSessionTimeout();
-                    clearSessionRetry();
-
-                    sessionInProgress = false;
-                    sessionInitialized = true;
-
-                    emit("sessionSuccess",
-                            put(
-                                    put(json(), "message", "session initialized"),
-                                    "attempt", sessionAttempt
-                            )
-                    );
-                }
-
-                @Override
-                public void onFailure(Exception e) {
-                    handleSessionFailure(
-                            "SESSION_FAILED",
-                            e == null ? "unknown" : e.getMessage(),
-                            true
-                    );
-                }
-            });
-
-            mainHandler.postDelayed(sessionTimeoutRunnable, sessionTimeoutMs);
-
-        } catch (SecurityException se) {
-            clearSessionTimeout();
-            sessionInProgress = false;
-            sessionInitialized = false;
-            emitError("NO_PERMISSION", se.getMessage());
-        } catch (Exception e) {
-            handleSessionFailure("SESSION_EXCEPTION", e.getMessage(), true);
-        }
+        startConnectAttempt(scanResult);
+        return CODE_SUCCESS;
     }
 
     @UniJSMethod(uiThread = true)
-    public void scanWifiList(JSONObject ignored) {
-        if (!ensureSessionReady()) return;
+    public int bleScanNetworks() {
+        if (!initialized || provisionManager == null) {
+            emitCode("wifiList", CODE_NOT_INITIALIZED);
+            return CODE_NOT_INITIALIZED;
+        }
+
+        if (!connected || espDevice == null) {
+            emitCode("wifiList", CODE_DEVICE_NOT_CONNECTED);
+            return CODE_DEVICE_NOT_CONNECTED;
+        }
+
+        if (!sessionInitialized) {
+            emitCode("wifiList", CODE_INIT_SESSION_FAILED);
+            return CODE_INIT_SESSION_FAILED;
+        }
+
+        if (provisioning) {
+            emitCode("wifiList", CODE_PROVISIONING);
+            return CODE_PROVISIONING;
+        }
+
+        int permissionCode = requestPermissionsIfNeeded(ACTION_SCAN_WIFI, null);
+        if (permissionCode != CODE_SUCCESS) {
+            emitCode("wifiList", permissionCode);
+            return permissionCode;
+        }
 
         try {
+            emitCode("wifiList", 100, simpleEvent("message", "wifi scan started"));
+
             espDevice.scanNetworks(new WiFiScanListener() {
                 @Override
                 public void onWifiListReceived(ArrayList<WiFiAccessPoint> list) {
-                    JSONArray arr = new JSONArray();
+                    JSONArray wifiList = new JSONArray();
 
                     if (list != null) {
                         for (WiFiAccessPoint ap : list) {
-                            JSONObject item = json();
-
-                            put(item, "ssid", ap.getWifiName());
-                            put(item, "rssi", ap.getRssi());
-                            put(item, "security", ap.getSecurity());
-
-                            arr.add(item);
+                            JSONObject item = new JSONObject();
+                            String wifiName = ap == null ? "" : ap.getWifiName();
+                            put(item, "wifiName", wifiName);
+                            put(item, "ssid", wifiName);
+                            put(item, "rssi", ap == null ? 0 : ap.getRssi());
+                            put(item, "security", ap == null ? 0 : ap.getSecurity());
+                            wifiList.add(item);
                         }
                     }
 
-                    emit("wifiList", put(json(), "list", arr));
+                    JSONObject event = new JSONObject();
+                    put(event, "wifiList", wifiList);
+                    put(event, "message", "wifi list received");
+                    emitCode("wifiList", 1, event);
                 }
 
                 @Override
                 public void onWiFiScanFailed(Exception e) {
-                    emitError(
-                            "WIFI_SCAN_FAILED",
-                            e == null ? "unknown" : e.getMessage()
-                    );
+                    emitCode("wifiList", 2, messageEvent(e));
                 }
             });
+
+            return CODE_SUCCESS;
         } catch (Exception e) {
-            emitError("WIFI_SCAN_EXCEPTION", e.getMessage());
+            emitCode("wifiList", 2, messageEvent(e));
+            return CODE_PARAM_ERROR;
         }
     }
 
     @UniJSMethod(uiThread = true)
-    public void provision(JSONObject data) {
-        if (!ensureSessionReady()) return;
-
-        String ssid = getString(data, "ssid", "");
-        String password = getString(data, "password", "");
-
-        boolean autoDisconnect = getBoolean(
-                data,
-                "autoDisconnectAfterProvision",
-                autoDisconnectAfterProvision
-        );
-
-        if (ssid.length() == 0) {
-            emitError("SSID_EMPTY", "ssid is required");
-            return;
+    public int bleStartProvisioning(JSONObject data) {
+        if (!initialized || provisionManager == null) {
+            emitCode("provisioningCodeState", CODE_NOT_INITIALIZED);
+            return CODE_NOT_INITIALIZED;
         }
 
+        if (!connected || espDevice == null) {
+            emitCode("provisioningCodeState", CODE_DEVICE_NOT_CONNECTED);
+            return CODE_DEVICE_NOT_CONNECTED;
+        }
+
+        if (!sessionInitialized) {
+            emitCode("provisioningCodeState", CODE_INIT_SESSION_FAILED);
+            return CODE_INIT_SESSION_FAILED;
+        }
+
+        if (provisioning) {
+            emitCode("provisioningCodeState", CODE_PROVISIONING);
+            return CODE_PROVISIONING;
+        }
+
+        if (data == null) {
+            emitCode("provisioningCodeState", CODE_PARAM_ERROR, simpleEvent("message", "data is null"));
+            return CODE_PARAM_ERROR;
+        }
+
+        int permissionCode = requestPermissionsIfNeeded(ACTION_PROVISION, data);
+        if (permissionCode != CODE_SUCCESS) {
+            emitCode("provisioningCodeState", permissionCode);
+            return permissionCode;
+        }
+
+        String wifiName = firstNonEmpty(
+                getString(data, "wifiName", ""),
+                getString(data, "ssid", "")
+        );
+
+        String password = firstNonEmpty(
+                getString(data, "passWord", ""),
+                getString(data, "password", "")
+        );
+
+        if (wifiName.length() == 0) {
+            emitCode("provisioningCodeState", CODE_PARAM_ERROR, simpleEvent("message", "wifiName is empty"));
+            return CODE_PARAM_ERROR;
+        }
+
+        autoDisconnectAfterProvision = getBoolean(data, "autoDisconnectAfterProvision", autoDisconnectAfterProvision);
+        provisionTimeoutMs = sanitizeTimeout(getInt(data, "provisionTimeoutMs", provisionTimeoutMs), DEFAULT_PROVISION_TIMEOUT_MS);
+
+        provisioning = true;
+        long taskId = ++provisionTaskId;
+
+        mainHandler.removeCallbacks(provisionTimeoutRunnable);
+        mainHandler.postDelayed(provisionTimeoutRunnable, provisionTimeoutMs);
+
         try {
-            espDevice.provision(ssid, password, new ProvisionListener() {
+            espDevice.provision(wifiName, password, new ProvisionListener() {
                 @Override
                 public void createSessionFailed(Exception e) {
-                    emitError(
-                            "CREATE_SESSION_FAILED",
-                            e == null ? "unknown" : e.getMessage()
-                    );
+                    if (!isCurrentProvisionTask(taskId)) return;
+                    finishProvisionFailure(10, e);
                 }
 
                 @Override
                 public void wifiConfigSent() {
-                    emit("wifiConfigSent", json());
+                    if (!isCurrentProvisionTask(taskId)) return;
+                    emitCode("provisioningCodeState", 100, simpleEvent("message", "wifi config sent"));
                 }
 
                 @Override
                 public void wifiConfigFailed(Exception e) {
-                    emitError(
-                            "WIFI_CONFIG_FAILED",
-                            e == null ? "unknown" : e.getMessage()
-                    );
+                    if (!isCurrentProvisionTask(taskId)) return;
+                    finishProvisionFailure(10, e);
                 }
 
                 @Override
                 public void wifiConfigApplied() {
-                    emit("wifiConfigApplied", json());
+                    if (!isCurrentProvisionTask(taskId)) return;
+                    emitCode("provisioningCodeState", 101, simpleEvent("message", "wifi config applied"));
                 }
 
                 @Override
                 public void wifiConfigApplyFailed(Exception e) {
-                    emitError(
-                            "WIFI_APPLY_FAILED",
-                            e == null ? "unknown" : e.getMessage()
-                    );
+                    if (!isCurrentProvisionTask(taskId)) return;
+                    finishProvisionFailure(10, e);
                 }
 
                 @Override
-                public void provisioningFailedFromDevice(
-                        ESPConstants.ProvisionFailureReason reason
-                ) {
-                    emitError(
-                            "PROVISION_FAILED_FROM_DEVICE",
-                            String.valueOf(reason)
-                    );
+                public void provisioningFailedFromDevice(ESPConstants.ProvisionFailureReason reason) {
+                    if (!isCurrentProvisionTask(taskId)) return;
+
+                    int codeState = mapProvisionFailure(reason);
+                    JSONObject event = new JSONObject();
+                    put(event, "reason", String.valueOf(reason));
+                    put(event, "message", String.valueOf(reason));
+                    finishProvisionFailure(codeState, event);
                 }
 
                 @Override
                 public void deviceProvisioningSuccess() {
-                    emit("provisionSuccess", put(json(), "ssid", ssid));
+                    if (!isCurrentProvisionTask(taskId)) return;
 
-                    if (autoDisconnect) {
+                    mainHandler.removeCallbacks(provisionTimeoutRunnable);
+                    provisioning = false;
+
+                    JSONObject event = new JSONObject();
+                    put(event, "wifiName", wifiName);
+                    put(event, "message", "provision success");
+                    emitCode("provisioningCodeState", 0, event);
+
+                    if (autoDisconnectAfterProvision) {
                         mainHandler.postDelayed(() -> {
-                            userInitiatedDisconnect = true;
+                            disconnectReason = "provisionSuccess";
                             disconnectQuietly();
                         }, 800);
                     }
@@ -720,58 +610,91 @@ public class RdbbBleEspProvisioningModule extends UniModule {
 
                 @Override
                 public void onProvisioningFailed(Exception e) {
-                    emitError(
-                            "PROVISION_FAILED",
-                            e == null ? "unknown" : e.getMessage()
-                    );
+                    if (!isCurrentProvisionTask(taskId)) return;
+                    finishProvisionFailure(10, e);
                 }
             });
+
+            return CODE_SUCCESS;
         } catch (Exception e) {
-            emitError("PROVISION_EXCEPTION", e.getMessage());
+            finishProvisionFailure(10, e);
+            return CODE_PARAM_ERROR;
         }
     }
 
     @UniJSMethod(uiThread = true)
-    public JSONObject disconnect(JSONObject ignored) {
-        userInitiatedDisconnect = true;
+    public int bleStopProvisioning() {
+        clearProvisionState();
+        emitCode("provisioningCodeState", 3, simpleEvent("message", "provision stopped"));
+        return CODE_SUCCESS;
+    }
 
-        clearConnectState();
-        clearSessionState();
+    @UniJSMethod(uiThread = true)
+    public int bleStopDisconnectDevice() {
+        disconnectReason = "user";
 
+        clearConnectTimers();
+        clearSessionTimers();
+        clearProvisionState();
+
+        disconnectQuietly();
+
+        connected = false;
         sessionInitialized = false;
-        deviceConnected = false;
+        connecting = false;
+        sessionInitializing = false;
+        espDevice = null;
 
-        try {
-            if (espDevice != null) {
-                espDevice.disconnectDevice();
-            }
-        } catch (Exception ignoredEx) {
+        emitCode("bleConnectCodeState", 3, simpleEvent("reason", "user"));
+        return CODE_SUCCESS;
+    }
+
+    @Subscribe(threadMode = ThreadMode.MAIN)
+    public void onDeviceConnectionEvent(DeviceConnectionEvent event) {
+        if (event == null) return;
+
+        int eventType = event.getEventType();
+
+        if (eventType == ESPConstants.EVENT_DEVICE_CONNECTED) {
+            clearConnectTimers();
+
+            connecting = false;
+            connected = true;
+            sessionInitialized = false;
+
+            JSONObject obj = new JSONObject();
+            put(obj, "name", connectedName);
+            put(obj, "address", connectedAddress);
+            put(obj, "primaryServiceUuid", connectedServiceUuid);
+            put(obj, "message", "ble connected");
+            emitCode("bleConnectCodeState", 1, obj);
+
+            startSessionAttempt();
+            return;
         }
 
-        return ok("disconnect requested");
-    }
+        if (eventType == ESPConstants.EVENT_DEVICE_CONNECTION_FAILED) {
+            handleConnectFailure(true);
+            return;
+        }
 
-    @UniJSMethod(uiThread = true)
-    public JSONObject destroy(JSONObject ignored) {
-        releaseResources(true);
-        return ok("destroyed");
-    }
+        if (eventType == ESPConstants.EVENT_DEVICE_DISCONNECTED) {
+            clearConnectTimers();
+            clearSessionTimers();
+            clearProvisionState();
 
-    @UniJSMethod(uiThread = true)
-    public JSONObject getState(JSONObject ignored) {
-        JSONObject state = json();
+            connecting = false;
+            connected = false;
+            sessionInitializing = false;
+            sessionInitialized = false;
 
-        put(state, "scanning", scanning);
-        put(state, "connectionInProgress", connectionInProgress);
-        put(state, "sessionInProgress", sessionInProgress);
-        put(state, "deviceConnected", deviceConnected);
-        put(state, "sessionInitialized", sessionInitialized);
-        put(state, "deviceName", deviceName);
-        put(state, "address", connectAddress);
-        put(state, "serviceUuid", connectServiceUuid);
-        put(state, "securityType", connectSecurityType);
+            JSONObject eventObj = new JSONObject();
+            put(eventObj, "reason", disconnectReason);
+            put(eventObj, "message", "ble disconnected");
+            emitCode("bleConnectCodeState", 3, eventObj);
 
-        return put(put(json(), "success", true), "state", state);
+            disconnectReason = "remote";
+        }
     }
 
     @Override
@@ -782,7 +705,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
 
     @Override
     public void onActivityDestroy() {
-        releaseResources(true);
+        releaseAll(true);
         super.onActivityDestroy();
     }
 
@@ -790,11 +713,13 @@ public class RdbbBleEspProvisioningModule extends UniModule {
     public void onActivityResult(int requestCode, int resultCode, Intent data) {
         if (requestCode == REQUEST_CODE_ENABLE_BLUETOOTH) {
             if (resultCode == Activity.RESULT_OK) {
-                emit("bluetoothEnabled", json());
+                emitState("blePermissions", true);
+                emitCode("bleEnvironmentInit", CODE_SUCCESS, simpleEvent("message", "bluetooth enabled"));
                 resumePendingAction();
             } else {
+                emitState("blePermissions", false);
+                emitCode("bleEnvironmentInit", CODE_BLE_NEED_ENABLE, simpleEvent("message", "bluetooth disabled"));
                 clearPendingAction();
-                emit("bluetoothEnableCanceled", json());
             }
         }
 
@@ -802,245 +727,361 @@ public class RdbbBleEspProvisioningModule extends UniModule {
     }
 
     @Override
-    public void onRequestPermissionsResult(
-            int requestCode,
-            String[] permissions,
-            int[] grantResults
-    ) {
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         if (requestCode == REQUEST_CODE_PERMISSIONS) {
-            String actionName = actionName(pendingAction);
-
             if (allPermissionsGranted(grantResults)) {
-                emit("permissionGranted", put(json(), "action", actionName));
-                resumePendingAction();
-            } else {
-                JSONArray denied = new JSONArray();
+                emitState(permissionEventTag(), true);
 
-                if (permissions != null && grantResults != null) {
-                    for (int i = 0; i < permissions.length && i < grantResults.length; i++) {
-                        if (grantResults[i] != PackageManager.PERMISSION_GRANTED) {
-                            denied.add(permissions[i]);
-                        }
-                    }
+                if (pendingAction == ACTION_NONE) {
+                    emitCode("bleEnvironmentInit", CODE_SUCCESS, simpleEvent("message", "permissions granted"));
                 }
 
+                resumePendingAction();
+            } else {
+                emitState(permissionEventTag(), false);
+                emitCode("bleEnvironmentInit", permissionDeniedCode(), simpleEvent("message", "permission denied"));
                 clearPendingAction();
-
-                emit("permissionDenied",
-                        put(
-                                put(json(), "action", actionName),
-                                "permissions", denied
-                        )
-                );
             }
         }
 
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
     }
 
-    private void handleScanTimeout() {
-        if (!scanning) return;
+    private int updateConfig(JSONObject options) {
+        securityType = normalizeSecurityType(getInt(options, "securityType", securityType));
+        pop = getString(options, "pop", pop);
+        devicePrefix = getString(options, "prefix", devicePrefix);
 
-        stopScanInternal(true);
+        String uuid = getString(options, "serviceUuid", configuredServiceUuid).trim();
+        if (uuid.length() > 0 && !isValidUuid(uuid)) {
+            emitCode("configCodeState", CODE_PARAM_ERROR, simpleEvent("message", "Invalid serviceUuid."));
+            return CODE_PARAM_ERROR;
+        }
 
-        emit("scanTimeout", put(json(), "count", devices.size()));
+        configuredServiceUuid = uuid;
+
+        scanTimeoutMs = sanitizeTimeout(getInt(options, "scanTimeoutMs", scanTimeoutMs), DEFAULT_SCAN_TIMEOUT_MS);
+        connectTimeoutMs = sanitizeTimeout(getInt(options, "connectTimeoutMs", connectTimeoutMs), DEFAULT_CONNECT_TIMEOUT_MS);
+        sessionTimeoutMs = sanitizeTimeout(getInt(options, "sessionTimeoutMs", sessionTimeoutMs), DEFAULT_SESSION_TIMEOUT_MS);
+        provisionTimeoutMs = sanitizeTimeout(getInt(options, "provisionTimeoutMs", provisionTimeoutMs), DEFAULT_PROVISION_TIMEOUT_MS);
+        retryDelayMs = sanitizeTimeout(getInt(options, "retryDelayMs", retryDelayMs), DEFAULT_RETRY_DELAY_MS);
+        autoDisconnectAfterProvision = getBoolean(options, "autoDisconnectAfterProvision", autoDisconnectAfterProvision);
+
+        return CODE_SUCCESS;
     }
 
-    private void handleConnectTimeout() {
-        if (!connectionInProgress) return;
+    private List<ScanFilter> buildScanFilters() {
+        List<ScanFilter> filters = new ArrayList<>();
 
-        handleConnectFailure(
-                "CONNECT_TIMEOUT",
-                "BLE connection timed out",
-                true
-        );
+        if (isValidUuid(configuredServiceUuid)) {
+            filters.add(new ScanFilter.Builder()
+                    .setServiceUuid(ParcelUuid.fromString(configuredServiceUuid))
+                    .build());
+        }
+
+        return filters;
     }
 
-    private void handleSessionTimeout() {
-        if (!sessionInProgress) return;
+    private void handleScanResult(ScanResult result) {
+        if (result == null || result.getDevice() == null) return;
 
-        handleSessionFailure(
-                "SESSION_TIMEOUT",
-                "Session initialization timed out",
-                true
-        );
+        String name = resolveDeviceName(result);
+        if (name == null) name = "";
+
+        if (devicePrefix.length() > 0 && !name.startsWith(devicePrefix)) return;
+
+        String address;
+        try {
+            address = result.getDevice().getAddress();
+        } catch (SecurityException e) {
+            return;
+        }
+
+        if (address == null || address.length() == 0) return;
+        if (scannedResults.containsKey(address)) return;
+
+        scannedResults.put(address, result);
+
+        String serviceUuid = resolvePrimaryServiceUuid(result);
+
+        JSONObject device = new JSONObject();
+        put(device, "name", name.length() > 0 ? name : "未命名设备");
+        put(device, "deviceName", name.length() > 0 ? name : "未命名设备");
+        put(device, "address", address);
+        put(device, "rssi", result.getRssi());
+        put(device, "serviceUuid", serviceUuid == null ? "" : serviceUuid);
+        put(device, "primaryServiceUuid", serviceUuid == null ? "" : serviceUuid);
+
+        JSONObject event = new JSONObject();
+        put(event, "mBleDevice", device);
+        emitRaw(eventWithTag("mBleDevice", event));
     }
 
-    private void handleConnectFailure(
-            String code,
-            String message,
-            boolean retryable
-    ) {
-        clearConnectTimeout();
-        clearConnectRetry();
+    private void startConnectAttempt(ScanResult scanResult) {
+        if (scanResult == null || scanResult.getDevice() == null) {
+            finishConnectFailure("Invalid ScanResult.");
+            return;
+        }
 
-        disconnectQuietly();
+        try {
+            clearConnectTimers();
+            clearSessionTimers();
+            clearProvisionState();
 
-        deviceConnected = false;
+            disconnectReason = "reconnect";
+            disconnectQuietly();
+
+            ESPConstants.SecurityType sec = securityType == 0
+                    ? ESPConstants.SecurityType.SECURITY_0
+                    : ESPConstants.SecurityType.SECURITY_1;
+
+            provisionManager.createESPDevice(ESPConstants.TransportType.TRANSPORT_BLE, sec);
+            espDevice = provisionManager.getEspDevice();
+
+            if (espDevice == null) {
+                finishConnectFailure("ESPDevice is null.");
+                return;
+            }
+
+            espDevice.setDeviceName(connectedName);
+            espDevice.setPrimaryServiceUuid(connectedServiceUuid);
+
+            if (securityType == 1 && pop != null && pop.length() > 0) {
+                espDevice.setProofOfPossession(pop);
+            }
+
+            connecting = true;
+            connected = false;
+            sessionInitialized = false;
+            connectAttempt++;
+
+            JSONObject event = new JSONObject();
+            put(event, "attempt", connectAttempt);
+            put(event, "name", connectedName);
+            put(event, "address", connectedAddress);
+            put(event, "primaryServiceUuid", connectedServiceUuid);
+            put(event, "message", "connecting");
+            emitCode("bleConnectCodeState", 100, event);
+
+            disconnectReason = "remote";
+            espDevice.connectBLEDevice(scanResult.getDevice(), connectedServiceUuid);
+
+            mainHandler.postDelayed(connectTimeoutRunnable, connectTimeoutMs);
+        } catch (SecurityException e) {
+            finishConnectFailure(safeMessage(e));
+        } catch (Exception e) {
+            finishConnectFailure(safeMessage(e));
+        }
+    }
+
+    private void startSessionAttempt() {
+        if (!connected || espDevice == null) {
+            emitCode("initSessionCodeState", 2, simpleEvent("message", "Device is not connected."));
+            return;
+        }
+
+        clearSessionTimers();
+
+        sessionInitializing = true;
+        sessionInitialized = false;
+        sessionAttempt++;
+
+        JSONObject startEvent = new JSONObject();
+        put(startEvent, "attempt", sessionAttempt);
+        put(startEvent, "message", "session initializing");
+        emitCode("initSessionCodeState", 100, startEvent);
+
+        try {
+            espDevice.initSession(new ResponseListener() {
+                @Override
+                public void onSuccess(byte[] returnData) {
+                    clearSessionTimers();
+
+                    sessionInitializing = false;
+                    sessionInitialized = true;
+
+                    emitCode("initSessionCodeState", 1, simpleEvent("message", "session success"));
+                }
+
+                @Override
+                public void onFailure(Exception e) {
+                    handleSessionFailure(true, e);
+                }
+            });
+
+            mainHandler.postDelayed(sessionTimeoutRunnable, sessionTimeoutMs);
+        } catch (Exception e) {
+            handleSessionFailure(true, e);
+        }
+    }
+
+    private void handleConnectFailure(boolean retryable) {
+        clearConnectTimers();
+
+        connected = false;
         sessionInitialized = false;
 
         if (retryable && connectRetriesRemaining > 0) {
-            ScanResult sr = devices.get(connectAddress);
-
-            int nextAttempt = connectAttempt + 1;
-            int retriesLeftAfterThis = connectRetriesRemaining - 1;
-
             connectRetriesRemaining--;
 
-            emit("connectRetry",
-                    put(
-                            put(
-                                    put(
-                                            put(json(), "attempt", nextAttempt),
-                                            "remainingRetries", retriesLeftAfterThis
-                                    ),
-                                    "code", code
-                            ),
-                            "message", safeMessage(message)
-                    )
-            );
-
-            pendingConnectRetryRunnable = () -> startConnectAttempt(sr);
+            ScanResult retryResult = scannedResults.get(connectedAddress);
+            pendingConnectRetryRunnable = () -> startConnectAttempt(retryResult);
             mainHandler.postDelayed(pendingConnectRetryRunnable, retryDelayMs);
             return;
         }
 
-        connectionInProgress = false;
-
-        emitError(code, safeMessage(message));
+        finishConnectFailure("Connect failed.");
     }
 
-    private void handleSessionFailure(
-            String code,
-            String message,
-            boolean retryable
-    ) {
-        clearSessionTimeout();
-        clearSessionRetry();
+    private void finishConnectFailure(String message) {
+        clearConnectTimers();
+        clearSessionTimers();
+
+        connecting = false;
+        connected = false;
+        sessionInitializing = false;
+        sessionInitialized = false;
+
+        disconnectReason = "connectFailed";
+        disconnectQuietly();
+        espDevice = null;
+
+        emitCode("bleConnectCodeState", 2, simpleEvent("message", message));
+    }
+
+    private void handleSessionFailure(boolean retryable, Exception e) {
+        clearSessionTimers();
 
         sessionInitialized = false;
 
         if (retryable && sessionRetriesRemaining > 0) {
-            int nextAttempt = sessionAttempt + 1;
-            int retriesLeftAfterThis = sessionRetriesRemaining - 1;
-
             sessionRetriesRemaining--;
-
-            emit("sessionRetry",
-                    put(
-                            put(
-                                    put(
-                                            put(json(), "attempt", nextAttempt),
-                                            "remainingRetries", retriesLeftAfterThis
-                                    ),
-                                    "code", code
-                            ),
-                            "message", safeMessage(message)
-                    )
-            );
 
             pendingSessionRetryRunnable = this::startSessionAttempt;
             mainHandler.postDelayed(pendingSessionRetryRunnable, retryDelayMs);
             return;
         }
 
-        sessionInProgress = false;
+        sessionInitializing = false;
 
-        emitError(code, safeMessage(message));
+        JSONObject event = new JSONObject();
+        put(event, "message", safeMessage(e));
+        put(event, "needReconnect", true);
+        emitCode("initSessionCodeState", 2, event);
+
+        disconnectReason = "sessionFailed";
+        disconnectQuietly();
+
+        connected = false;
+        sessionInitialized = false;
+        espDevice = null;
     }
 
-    private boolean ensureReady() {
-        if (appContext == null || provisionManager == null) {
-            emitError("NOT_INITIALIZED", "Call init first");
-            return false;
-        }
-
-        return true;
+    private void handleSessionFailure(boolean retryable) {
+        handleSessionFailure(retryable, new Exception("Session timeout."));
     }
 
-    private boolean ensureDevice() {
-        if (!ensureReady()) return false;
-
-        if (espDevice == null) {
-            emitError("DEVICE_NULL", "Call connect first");
-            return false;
-        }
-
-        return true;
+    private void finishProvisionFailure(int codeState, Exception e) {
+        finishProvisionFailure(codeState, messageEvent(e));
     }
 
-    private boolean ensureConnectedDevice() {
-        if (!ensureDevice()) return false;
-
-        if (!deviceConnected) {
-            emitError("DEVICE_NOT_CONNECTED", "Device is not connected");
-            return false;
-        }
-
-        return true;
+    private void finishProvisionFailure(int codeState, JSONObject event) {
+        mainHandler.removeCallbacks(provisionTimeoutRunnable);
+        provisioning = false;
+        provisionTaskId++;
+        emitCode("provisioningCodeState", codeState, event);
     }
 
-    private boolean ensureSessionReady() {
-        if (!ensureConnectedDevice()) return false;
-
-        if (!sessionInitialized) {
-            emitError("SESSION_NOT_INITIALIZED", "Call initializeSession first");
-            return false;
-        }
-
-        return true;
+    private boolean isCurrentProvisionTask(long taskId) {
+        return provisioning && taskId == provisionTaskId;
     }
 
-    private boolean ensurePermissions(int action, JSONObject data) {
-        String[] missingPermissions = getMissingPermissions(action);
+    private int mapProvisionFailure(ESPConstants.ProvisionFailureReason reason) {
+        if (reason == null) return 10;
+        if (reason == ESPConstants.ProvisionFailureReason.AUTH_FAILED) return 1;
+        if (reason == ESPConstants.ProvisionFailureReason.NETWORK_NOT_FOUND) return 2;
+        return 10;
+    }
 
-        if (missingPermissions.length == 0) return true;
+    private void onScanTimeout() {
+        if (!scanning) return;
+
+        stopScanInternal(false);
+
+        JSONObject obj = new JSONObject();
+        put(obj, "count", scannedResults.size());
+        put(obj, "message", "scan timeout");
+        emitCode("bleScanListenerCodeState", 0, obj);
+    }
+
+    private void onConnectTimeout() {
+        if (!connecting) return;
+        handleConnectFailure(true);
+    }
+
+    private void onSessionTimeout() {
+        if (!sessionInitializing) return;
+        handleSessionFailure(true);
+    }
+
+    private void onProvisionTimeout() {
+        if (!provisioning) return;
+
+        provisioning = false;
+        provisionTaskId++;
+
+        JSONObject event = new JSONObject();
+        put(event, "message", "Provision timeout.");
+        put(event, "timeoutMs", provisionTimeoutMs);
+        emitCode("provisioningCodeState", 10, event);
+    }
+
+    private int requestPermissionsIfNeeded(int action, Object data) {
+        String[] missing = getMissingPermissions(action);
+        if (missing.length == 0) return CODE_SUCCESS;
 
         Activity activity = activityRef.get();
+        if (activity == null) return permissionCodeByAndroidVersion();
 
-        if (activity == null) {
-            emitError("NO_ACTIVITY", "Foreground activity is unavailable for permission request");
-            return false;
+        pendingAction = action;
+        pendingActionData = data;
+
+        try {
+            activity.requestPermissions(missing, REQUEST_CODE_PERMISSIONS);
+            emitState(permissionEventTag(), false);
+
+            return Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                    ? CODE_BLE_PERMISSION_REQUESTED
+                    : CODE_LOCATION_PERMISSION_REQUIRED;
+        } catch (Exception e) {
+            clearPendingAction();
+            return permissionCodeByAndroidVersion();
         }
-
-        rememberPendingAction(action, data);
-
-        activity.requestPermissions(missingPermissions, REQUEST_CODE_PERMISSIONS);
-
-        emit("permissionRequest",
-                put(
-                        put(json(), "action", actionName(action)),
-                        "permissions", toJsonArray(missingPermissions)
-                )
-        );
-
-        return false;
     }
 
     private String[] getMissingPermissions(int action) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || appContext == null) {
+        if (appContext == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
             return new String[0];
         }
 
         List<String> permissions = new ArrayList<>();
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (action == ACTION_SCAN) {
-                if (!hasPermission(Manifest.permission.BLUETOOTH_SCAN)) {
-                    permissions.add(Manifest.permission.BLUETOOTH_SCAN);
-                }
-
-                if (!hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) {
-                    permissions.add(Manifest.permission.BLUETOOTH_CONNECT);
-                }
-            }
-
-            if ((action == ACTION_CONNECT || action == ACTION_INIT_SESSION)
+            if ((action == ACTION_NONE
+                    || action == ACTION_SCAN
+                    || action == ACTION_CONNECT
+                    || action == ACTION_SCAN_WIFI
+                    || action == ACTION_PROVISION)
                     && !hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) {
                 permissions.add(Manifest.permission.BLUETOOTH_CONNECT);
             }
+
+            if ((action == ACTION_NONE || action == ACTION_SCAN)
+                    && !hasPermission(Manifest.permission.BLUETOOTH_SCAN)) {
+                permissions.add(Manifest.permission.BLUETOOTH_SCAN);
+            }
         } else {
-            if (action == ACTION_SCAN
+            if ((action == ACTION_NONE || action == ACTION_SCAN)
                     && !hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) {
                 permissions.add(Manifest.permission.ACCESS_FINE_LOCATION);
             }
@@ -1049,57 +1090,67 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         return permissions.toArray(new String[0]);
     }
 
-    private boolean ensureBluetoothEnabled(int action, JSONObject data) {
+    private int ensureBluetoothEnabled(int action, Object data) {
         BluetoothAdapter adapter = getBluetoothAdapter();
+        if (adapter == null) return CODE_BLE_NOT_SUPPORTED;
 
-        if (adapter == null) {
-            emitError("BLE_UNAVAILABLE", "Bluetooth adapter is unavailable");
-            return false;
+        try {
+            if (adapter.isEnabled()) return CODE_SUCCESS;
+        } catch (SecurityException e) {
+            return permissionCodeByAndroidVersion();
         }
 
-        if (adapter.isEnabled()) return true;
-
-        rememberPendingAction(action, data);
-
-        emit("bluetoothDisabled", put(json(), "action", actionName(action)));
-
-        openBluetoothEnableScreen();
-
-        return false;
+        requestEnableBluetooth(action, data);
+        return CODE_BLE_NEED_ENABLE;
     }
 
-    private void openBluetoothEnableScreen() {
+    private void requestEnableBluetooth(int action, Object data) {
         Activity activity = activityRef.get();
+        if (activity == null) return;
 
-        if (activity == null) {
-            emitError("NO_ACTIVITY", "Foreground activity is unavailable for Bluetooth enable flow");
-            clearPendingAction();
-            return;
-        }
+        pendingAction = action;
+        pendingActionData = data;
 
         try {
             activity.startActivityForResult(
                     new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE),
                     REQUEST_CODE_ENABLE_BLUETOOTH
             );
-
-            emit("bluetoothEnableRequested", json());
-            return;
-        } catch (SecurityException ignored) {
-        } catch (Exception ignored) {
-        }
-
-        try {
-            activity.startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS));
-            emit("bluetoothSettingsOpened", json());
         } catch (Exception e) {
-            emitError("OPEN_BLUETOOTH_SETTINGS_FAILED", e.getMessage());
+            openBluetoothSettings(activity);
         }
-
-        clearPendingAction();
     }
 
-    private void stopScanInternal(boolean emitEvent) {
+    private void openBluetoothSettings(Activity activity) {
+        try {
+            activity.startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS));
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void resumePendingAction() {
+        int action = pendingAction;
+        Object data = pendingActionData;
+
+        clearPendingAction();
+
+        if (action == ACTION_SCAN) {
+            bleStartSearchDevice(data instanceof String ? (String) data : devicePrefix);
+        } else if (action == ACTION_CONNECT) {
+            bleConnectDevice(data instanceof JSONObject ? (JSONObject) data : null);
+        } else if (action == ACTION_SCAN_WIFI) {
+            bleScanNetworks();
+        } else if (action == ACTION_PROVISION) {
+            bleStartProvisioning(data instanceof JSONObject ? (JSONObject) data : null);
+        }
+    }
+
+    private void clearPendingAction() {
+        pendingAction = ACTION_NONE;
+        pendingActionData = null;
+    }
+
+    private void stopScanInternal(boolean emitStop) {
         mainHandler.removeCallbacks(scanTimeoutRunnable);
 
         boolean wasScanning = scanning;
@@ -1108,15 +1159,18 @@ public class RdbbBleEspProvisioningModule extends UniModule {
             if (scanner != null && scanCallback != null) {
                 scanner.stopScan(scanCallback);
             }
-        } catch (Exception ignoredEx) {
+        } catch (Exception ignored) {
         }
 
         scanning = false;
         scanner = null;
         scanCallback = null;
 
-        if (emitEvent && wasScanning) {
-            emit("scanStop", put(json(), "count", devices.size()));
+        if (emitStop && wasScanning) {
+            JSONObject obj = new JSONObject();
+            put(obj, "count", scannedResults.size());
+            put(obj, "message", "scan stopped");
+            emitCode("bleScanListenerCodeState", 0, obj);
         }
     }
 
@@ -1129,154 +1183,129 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         }
     }
 
-    private void releaseResources(boolean unregisterEventBus) {
-        clearPendingAction();
-        clearConnectState();
-        clearSessionState();
-
+    private void releaseAll(boolean unregisterEventBus) {
         stopScanInternal(false);
+
+        clearPendingAction();
+        clearConnectTimers();
+        clearSessionTimers();
+        clearProvisionState();
 
         mainHandler.removeCallbacksAndMessages(null);
 
-        userInitiatedDisconnect = true;
-
+        disconnectReason = "release";
         disconnectQuietly();
-
-        espDevice = null;
-        scanner = null;
-        scanCallback = null;
-
-        connectionInProgress = false;
-        sessionInProgress = false;
-        deviceConnected = false;
-        sessionInitialized = false;
-
-        devices.clear();
 
         if (unregisterEventBus && EventBus.getDefault().isRegistered(this)) {
             EventBus.getDefault().unregister(this);
         }
 
-        activityRef.clear();
+        scannedResults.clear();
+
+        scanner = null;
+        scanCallback = null;
+        espDevice = null;
+        provisionManager = null;
+
+        initialized = false;
+        scanning = false;
+        connecting = false;
+        connected = false;
+        sessionInitializing = false;
+        sessionInitialized = false;
+        provisioning = false;
+
+        connectedAddress = "";
+        connectedName = "";
+        connectedServiceUuid = "";
     }
 
-    private void clearConnectState() {
-        clearConnectTimeout();
-        clearConnectRetry();
-        connectionInProgress = false;
-    }
-
-    private void clearSessionState() {
-        clearSessionTimeout();
-        clearSessionRetry();
-        sessionInProgress = false;
-    }
-
-    private void clearConnectTimeout() {
+    private void clearConnectTimers() {
         mainHandler.removeCallbacks(connectTimeoutRunnable);
-    }
 
-    private void clearSessionTimeout() {
-        mainHandler.removeCallbacks(sessionTimeoutRunnable);
-    }
-
-    private void clearConnectRetry() {
         if (pendingConnectRetryRunnable != null) {
             mainHandler.removeCallbacks(pendingConnectRetryRunnable);
             pendingConnectRetryRunnable = null;
         }
     }
 
-    private void clearSessionRetry() {
+    private void clearSessionTimers() {
+        mainHandler.removeCallbacks(sessionTimeoutRunnable);
+
         if (pendingSessionRetryRunnable != null) {
             mainHandler.removeCallbacks(pendingSessionRetryRunnable);
             pendingSessionRetryRunnable = null;
         }
     }
 
+    private void clearProvisionState() {
+        mainHandler.removeCallbacks(provisionTimeoutRunnable);
+        provisioning = false;
+        provisionTaskId++;
+    }
+
     private BluetoothAdapter getBluetoothAdapter() {
         if (appContext == null) return null;
 
-        BluetoothManager bluetoothManager =
-                (BluetoothManager) appContext.getSystemService(Context.BLUETOOTH_SERVICE);
-
-        return bluetoothManager == null ? null : bluetoothManager.getAdapter();
+        BluetoothManager manager = (BluetoothManager) appContext.getSystemService(Context.BLUETOOTH_SERVICE);
+        return manager == null ? null : manager.getAdapter();
     }
 
     private String resolveDeviceName(ScanResult result) {
-        if (result == null) return null;
+        if (result == null) return "";
 
         ScanRecord record = result.getScanRecord();
-
-        if (record != null) {
-            String advertisedName = record.getDeviceName();
-
-            if (advertisedName != null && advertisedName.length() > 0) {
-                return advertisedName;
-            }
+        if (record != null && record.getDeviceName() != null && record.getDeviceName().length() > 0) {
+            return record.getDeviceName();
         }
 
         try {
-            return result.getDevice() == null ? null : result.getDevice().getName();
-        } catch (SecurityException ignored) {
-            return null;
+            return result.getDevice() == null || result.getDevice().getName() == null
+                    ? ""
+                    : result.getDevice().getName();
+        } catch (SecurityException e) {
+            return "";
         }
     }
 
     private String resolvePrimaryServiceUuid(ScanResult result) {
-        if (result == null) return null;
+        if (result == null || result.getScanRecord() == null) return "";
 
-        ScanRecord record = result.getScanRecord();
+        List<ParcelUuid> uuids = result.getScanRecord().getServiceUuids();
+        if (uuids == null || uuids.isEmpty()) return "";
 
-        if (record == null
-                || record.getServiceUuids() == null
-                || record.getServiceUuids().isEmpty()) {
-            return null;
-        }
-
-        if (isValidUuid(primaryServiceUuid)) {
-            for (ParcelUuid parcelUuid : record.getServiceUuids()) {
+        if (isValidUuid(configuredServiceUuid)) {
+            for (ParcelUuid parcelUuid : uuids) {
                 if (parcelUuid == null || parcelUuid.getUuid() == null) continue;
 
                 String uuid = parcelUuid.getUuid().toString();
-
-                if (uuid.equalsIgnoreCase(primaryServiceUuid)) {
+                if (uuid.equalsIgnoreCase(configuredServiceUuid)) {
                     return uuid;
                 }
             }
         }
 
-        ParcelUuid firstUuid = record.getServiceUuids().get(0);
-
-        if (firstUuid == null || firstUuid.getUuid() == null) {
-            return null;
-        }
-
-        return firstUuid.getUuid().toString();
+        ParcelUuid first = uuids.get(0);
+        return first == null || first.getUuid() == null ? "" : first.getUuid().toString();
     }
 
-    private String chooseServiceUuid(String scannedServiceUuid, String requestedServiceUuid) {
-        if (isValidUuid(scannedServiceUuid)) {
-            return scannedServiceUuid;
-        }
-
-        if (isValidUuid(requestedServiceUuid)) {
-            return requestedServiceUuid;
-        }
-
+    private String chooseServiceUuid(String scannedUuid, String requestedUuid) {
+        if (isValidUuid(scannedUuid)) return scannedUuid;
+        if (isValidUuid(requestedUuid)) return requestedUuid;
         return "";
     }
 
     private boolean hasPermission(String permission) {
         return Build.VERSION.SDK_INT < Build.VERSION_CODES.M
-                || appContext.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED;
+                || appContext != null
+                && appContext.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED;
     }
 
     private boolean allPermissionsGranted(int[] grantResults) {
         if (grantResults == null || grantResults.length == 0) return false;
 
-        for (int result : grantResults) {
-            if (result != PackageManager.PERMISSION_GRANTED) {
+        for (int grantResult : grantResults) {
+            if (grantResult != PackageManager.PERMISSION_GRANTED) {
                 return false;
             }
         }
@@ -1284,56 +1313,36 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         return true;
     }
 
-    private void rememberPendingAction(int action, JSONObject data) {
-        pendingAction = action;
-        pendingActionData = copy(data);
+    private String permissionEventTag() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                ? "blePermissionsState"
+                : "locationPermissions";
     }
 
-    private void resumePendingAction() {
-        int action = pendingAction;
-        JSONObject data = pendingActionData == null ? json() : copy(pendingActionData);
-
-        clearPendingAction();
-
-        if (action == ACTION_SCAN) {
-            searchESPDevices(data);
-        } else if (action == ACTION_CONNECT) {
-            connect(data);
-        } else if (action == ACTION_INIT_SESSION) {
-            initializeSession(data);
-        }
+    private int permissionCodeByAndroidVersion() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                ? CODE_BLE_PERMISSION_REQUIRED
+                : CODE_LOCATION_PERMISSION_REQUIRED;
     }
 
-    private void clearPendingAction() {
-        pendingAction = ACTION_NONE;
-        pendingActionData = null;
+    private int permissionDeniedCode() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                ? CODE_BLE_PERMISSION_REQUIRED
+                : CODE_LOCATION_PERMISSION_DENIED;
     }
 
-    private String actionName(int action) {
-        if (action == ACTION_SCAN) return "scan";
-        if (action == ACTION_CONNECT) return "connect";
-        if (action == ACTION_INIT_SESSION) return "initializeSession";
-        return "none";
-    }
-
-    private Context getUniContext() {
+    private void refreshContext() {
         try {
-            return mUniSDKInstance == null ? null : mUniSDKInstance.getContext();
-        } catch (Exception e) {
-            return null;
-        }
-    }
+            Context context = mUniSDKInstance == null ? null : mUniSDKInstance.getContext();
 
-    private Activity getUniActivity() {
-        Context context = getUniContext();
-        return context instanceof Activity ? (Activity) context : null;
-    }
+            if (context instanceof Activity) {
+                activityRef = new WeakReference<>((Activity) context);
+            }
 
-    private void refreshActivityReference() {
-        Activity activity = getUniActivity();
-
-        if (activity != null) {
-            activityRef = new WeakReference<>(activity);
+            if (context != null) {
+                appContext = context.getApplicationContext();
+            }
+        } catch (Exception ignored) {
         }
     }
 
@@ -1343,110 +1352,124 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         try {
             UUID.fromString(value);
             return true;
-        } catch (Exception ignored) {
+        } catch (Exception e) {
             return false;
         }
     }
 
-    private int sanitizeTimeout(int timeoutMs, int defaultValue) {
-        return timeoutMs > 0 ? timeoutMs : defaultValue;
+    private int normalizeSecurityType(int value) {
+        return value == 0 ? 0 : 1;
     }
 
-    private int sanitizeRetryCount(int retryCount) {
-        return Math.max(0, retryCount);
+    private int sanitizeTimeout(int value, int defaultValue) {
+        return value > 0 ? value : defaultValue;
     }
 
-    private String safeMessage(String message) {
-        return message == null ? "unknown" : message;
+    private int sanitizeRetryCount(int value) {
+        return Math.max(0, value);
     }
 
-    private JSONObject json() {
-        return new JSONObject();
+    private String getString(JSONObject obj, String key, String defaultValue) {
+        if (obj == null || key == null) return defaultValue;
+
+        String value = obj.getString(key);
+        return value == null ? defaultValue : value.trim();
     }
 
-    private JSONObject put(JSONObject obj, String key, Object value) {
-        try {
-            obj.put(key, value);
-        } catch (Exception ignored) {
+    private int getInt(JSONObject obj, String key, int defaultValue) {
+        if (obj == null || key == null) return defaultValue;
+
+        Integer value = obj.getInteger(key);
+        return value == null ? defaultValue : value;
+    }
+
+    private boolean getBoolean(JSONObject obj, String key, boolean defaultValue) {
+        if (obj == null || key == null) return defaultValue;
+
+        Boolean value = obj.getBoolean(key);
+        return value == null ? defaultValue : value;
+    }
+
+    private String firstNonEmpty(String... values) {
+        if (values == null) return "";
+
+        for (String value : values) {
+            if (value != null && value.length() > 0) {
+                return value;
+            }
+        }
+
+        return "";
+    }
+
+    private String safeMessage(Exception e) {
+        return e == null || e.getMessage() == null ? "unknown" : e.getMessage();
+    }
+
+    private JSONObject messageEvent(Exception e) {
+        return simpleEvent("message", safeMessage(e));
+    }
+
+    private JSONObject simpleEvent(String key, Object value) {
+        JSONObject obj = new JSONObject();
+        put(obj, key, value);
+        return obj;
+    }
+
+    private JSONObject eventWithTag(String tag, JSONObject extra) {
+        JSONObject obj = new JSONObject();
+
+        put(obj, "tag", tag);
+
+        if (extra != null) {
+            obj.putAll(extra);
         }
 
         return obj;
     }
 
-    private JSONObject copy(JSONObject source) {
-        JSONObject target = new JSONObject();
+    private void emitCode(String tag, int code) {
+        emitCode(tag, code, null);
+    }
 
-        if (source != null) {
-            target.putAll(source);
+    private void emitCode(String tag, int code, JSONObject extra) {
+        JSONObject obj = new JSONObject();
+
+        put(obj, "tag", tag);
+        put(obj, "code", code);
+        put(obj, "codeState", code);
+
+        if (extra != null) {
+            obj.putAll(extra);
         }
 
-        return target;
+        emitRaw(obj);
     }
 
-    private String getString(JSONObject obj, String key, String defaultValue) {
-        String value = obj == null ? null : obj.getString(key);
-        return value == null ? defaultValue : value;
+    private void emitState(String tag, boolean state) {
+        JSONObject obj = new JSONObject();
+
+        put(obj, "tag", tag);
+        put(obj, "state", state);
+
+        emitRaw(obj);
     }
 
-    private int getInt(JSONObject obj, String key, int defaultValue) {
-        Integer value = obj == null ? null : obj.getInteger(key);
-        return value == null ? defaultValue : value;
-    }
-
-    private boolean getBoolean(JSONObject obj, String key, boolean defaultValue) {
-        Boolean value = obj == null ? null : obj.getBoolean(key);
-        return value == null ? defaultValue : value;
-    }
-
-    private JSONArray toJsonArray(String[] values) {
-        JSONArray array = new JSONArray();
-
-        if (values != null) {
-            for (String value : values) {
-                array.add(value);
-            }
-        }
-
-        return array;
-    }
-
-    private JSONObject ok(String msg) {
-        return put(
-                put(json(), "success", true),
-                "message", msg
-        );
-    }
-
-    private JSONObject fail(String code, String msg) {
-        return put(
-                put(
-                        put(json(), "success", false),
-                        "code", code
-                ),
-                "message", msg
-        );
-    }
-
-    private void emitError(String code, String message) {
-        emit(
-                "error",
-                put(
-                        put(json(), "code", code),
-                        "message", message == null ? "" : message
-                )
-        );
-    }
-
-    private void emit(String type, JSONObject data) {
+    private void emitRaw(JSONObject obj) {
         try {
-            JSONObject obj = json();
-
-            put(obj, "type", type);
-            put(obj, "data", data == null ? json() : data);
-
             if (mUniSDKInstance != null) {
-                mUniSDKInstance.fireGlobalEventCallback(EVENT_NAME, obj);
+                mUniSDKInstance.fireGlobalEventCallback(
+                        EVENT_NAME,
+                        obj == null ? new JSONObject() : obj
+                );
             }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void put(JSONObject obj, String key, Object value) {
+        try {
+            obj.put(key, value);
         } catch (Exception ignored) {
         }
     }
