@@ -13,6 +13,7 @@ import android.bluetooth.le.ScanSettings;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.location.LocationManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
@@ -44,19 +45,28 @@ import java.util.UUID;
 import io.dcloud.feature.uniapp.annotation.UniJSMethod;
 import io.dcloud.feature.uniapp.common.UniModule;
 
+/**
+ * ESP32 BLE 蓝牙配网 uni-app 原生模块
+ * 功能：扫描 ESP 设备 -> 连接 -> 加密会话 -> 获取设备周边 WiFi -> 下发 WiFi 账号密码
+ */
 public class RdbbBleEspProvisioningModule extends UniModule {
 
+    // ==================== 全局常量定义 ====================
+    /** 前端监听的全局事件名称 */
     private static final String EVENT_NAME = "espEvent";
 
+    /** 权限请求、蓝牙开启请求码 */
     private static final int REQUEST_CODE_PERMISSIONS = 41001;
     private static final int REQUEST_CODE_ENABLE_BLUETOOTH = 41002;
 
+    /** 当前执行的动作类型：无/扫描/连接/扫描WiFi/配网 */
     private static final int ACTION_NONE = 0;
     private static final int ACTION_SCAN = 1;
     private static final int ACTION_CONNECT = 2;
     private static final int ACTION_SCAN_WIFI = 3;
     private static final int ACTION_PROVISION = 4;
 
+    // ==================== 状态码 ====================
     public static final int CODE_SUCCESS = 0;
     public static final int CODE_ENV_EXISTS = 1;
     public static final int CODE_NOT_INITIALIZED = 2;
@@ -81,6 +91,28 @@ public class RdbbBleEspProvisioningModule extends UniModule {
     public static final int CODE_BLE_PERMISSION_REQUIRED = 21;
     public static final int CODE_BLE_PERMISSION_REQUESTED = 22;
 
+    // ==================== 事件回调码 ====================
+    private static final int EVENT_SCAN_STARTED = 100;
+    private static final int EVENT_SCAN_FINISHED = 0;
+    private static final int EVENT_CONNECTING = 100;
+    private static final int EVENT_CONNECTED = 1;
+    private static final int EVENT_CONNECT_FAILED = 2;
+    private static final int EVENT_DISCONNECTED = 3;
+    private static final int EVENT_SESSION_START = 100;
+    private static final int EVENT_SESSION_SUCCESS = 1;
+    private static final int EVENT_SESSION_FAILED = 2;
+    private static final int EVENT_WIFI_SCAN_START = 100;
+    private static final int EVENT_WIFI_LIST = 1;
+    private static final int EVENT_WIFI_SCAN_FAILED = 2;
+    private static final int EVENT_PROVISION_SUCCESS = 0;
+    private static final int EVENT_PROVISION_AUTH_FAILED = 1;
+    private static final int EVENT_PROVISION_NETWORK_NOT_FOUND = 2;
+    private static final int EVENT_PROVISION_STOPPED = 3;
+    private static final int EVENT_PROVISION_RUNNING = 100;
+    private static final int EVENT_PROVISION_APPLIED = 101;
+    private static final int EVENT_PROVISION_FAILED = 10;
+
+    // ==================== 默认超时/重试配置 ====================
     private static final int DEFAULT_SCAN_TIMEOUT_MS = 10000;
     private static final int DEFAULT_CONNECT_TIMEOUT_MS = 15000;
     private static final int DEFAULT_SESSION_TIMEOUT_MS = 10000;
@@ -89,36 +121,44 @@ public class RdbbBleEspProvisioningModule extends UniModule {
     private static final int DEFAULT_MAX_CONNECT_RETRIES = 1;
     private static final int DEFAULT_MAX_SESSION_RETRIES = 1;
 
+    /** 主线程 Handler，处理延时任务、超时 */
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
+    /** 各类超时任务 */
     private final Runnable scanTimeoutRunnable = this::onScanTimeout;
     private final Runnable connectTimeoutRunnable = this::onConnectTimeout;
     private final Runnable sessionTimeoutRunnable = this::onSessionTimeout;
     private final Runnable provisionTimeoutRunnable = this::onProvisionTimeout;
 
+    // ==================== 上下文与管理器 ====================
     private Context appContext;
     private WeakReference<Activity> activityRef = new WeakReference<>(null);
 
+    /** ESP 配网核心管理器 */
     private ESPProvisionManager provisionManager;
+    /** 当前连接的 ESP 设备对象 */
     private ESPDevice espDevice;
 
+    /** BLE 扫描器与回调 */
     private BluetoothLeScanner scanner;
     private ScanCallback scanCallback;
 
+    /** 扫描到的设备缓存：key=Mac 地址 */
     private final Map<String, ScanResult> scannedResults = new HashMap<>();
 
+    // ==================== 动作队列与参数 ====================
     private int pendingAction = ACTION_NONE;
     private Object pendingActionData;
 
-    private String devicePrefix = "";
-    private String configuredServiceUuid = "";
-    private String connectedAddress = "";
-    private String connectedName = "";
-    private String connectedServiceUuid = "";
-    private String pop = "";
-    private String disconnectReason = "remote";
+    private String devicePrefix = "";           // 设备名称前缀过滤
+    private String configuredServiceUuid = "";  // 配置的服务 UUID
+    private String connectedAddress = "";       // 已连接设备 MAC
+    private String connectedName = "";          // 已连接设备名称
+    private String connectedServiceUuid = "";   // 已连接服务 UUID
+    private String pop = "";                    // 配网密钥
+    private String disconnectReason = "remote"; // 断开原因
 
-    private int securityType = 1;
+    private int securityType = 1;               // 加密类型 0/1
     private int scanTimeoutMs = DEFAULT_SCAN_TIMEOUT_MS;
     private int connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS;
     private int sessionTimeoutMs = DEFAULT_SESSION_TIMEOUT_MS;
@@ -129,20 +169,28 @@ public class RdbbBleEspProvisioningModule extends UniModule {
     private int connectAttempt = 0;
     private int sessionAttempt = 0;
 
-    private long provisionTaskId = 0;
+    private long provisionTaskId = 0;           // 配网任务 ID，防止并发混乱
 
-    private boolean initialized = false;
-    private boolean scanning = false;
-    private boolean connecting = false;
-    private boolean connected = false;
-    private boolean sessionInitializing = false;
-    private boolean sessionInitialized = false;
-    private boolean provisioning = false;
-    private boolean autoDisconnectAfterProvision = false;
+    // ==================== 状态标志 ====================
+    private boolean initialized = false;        // 模块是否初始化
+    private boolean scanning = false;           // 是否正在扫描
+    private boolean connecting = false;         // 是否正在连接
+    private boolean connected = false;          // 是否已连接
+    private boolean sessionInitializing = false;// 会话初始化中
+    private boolean sessionInitialized = false; // 会话已建立
+    private boolean provisioning = false;       // 配网中
+    private boolean autoDisconnectAfterProvision = false; // 配网完成自动断开
+    private boolean ignoreNextDisconnectEvent = false;   // 忽略下一次断开事件
 
     private Runnable pendingConnectRetryRunnable;
     private Runnable pendingSessionRetryRunnable;
 
+    // ==================== 前端可调用方法（uni 接口） ====================
+
+    /**
+     * 初始化 BLE 配网环境
+     * 检查：BLE 支持、权限、蓝牙开启、初始化 ESP 管理器
+     */
     @UniJSMethod(uiThread = true)
     public int bleEnvironmentOnLoad(JSONObject options) {
         refreshContext();
@@ -169,6 +217,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
             return CODE_ENV_EXISTS;
         }
 
+        // 获取 ESP 配网单例
         provisionManager = ESPProvisionManager.getInstance(appContext);
         initialized = provisionManager != null;
 
@@ -177,6 +226,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
             return CODE_NOT_INITIALIZED;
         }
 
+        // 注册事件总线，接收设备连接状态
         if (!EventBus.getDefault().isRegistered(this)) {
             EventBus.getDefault().register(this);
         }
@@ -190,17 +240,10 @@ public class RdbbBleEspProvisioningModule extends UniModule {
             }
         }
 
-        try {
-            if (!adapter.isEnabled()) {
-                emitState("blePermissions", false);
-                requestEnableBluetooth(ACTION_NONE, null);
-                emitCode("bleEnvironmentInit", CODE_BLE_NEED_ENABLE, simpleEvent("message", "bluetooth disabled"));
-                return CODE_BLE_NEED_ENABLE;
-            }
-        } catch (SecurityException e) {
-            int code = permissionCodeByAndroidVersion();
-            emitCode("bleEnvironmentInit", code, messageEvent(e));
-            return code;
+        int bluetoothCode = ensureBluetoothEnabled(ACTION_NONE, null);
+        if (bluetoothCode != CODE_SUCCESS) {
+            emitCode("bleEnvironmentInit", bluetoothCode, simpleEvent("message", "bluetooth disabled"));
+            return bluetoothCode;
         }
 
         emitState("blePermissions", true);
@@ -208,13 +251,20 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         return CODE_SUCCESS;
     }
 
+    /**
+     * 卸载模块，释放所有资源
+     */
     @UniJSMethod(uiThread = true)
     public int bleEnvironmentOnUnload() {
         releaseAll(true);
-        emitCode("bleEnvironmentUnload", CODE_SUCCESS);
+        emitCode("bleEnvironmentUnload", CODE_SUCCESS, simpleEvent("message", "environment released"));
         return CODE_SUCCESS;
     }
 
+    /**
+     * 开始搜索 ESP BLE 设备
+     * @param prefix 设备名称前缀过滤
+     */
     @UniJSMethod(uiThread = true)
     public int bleStartSearchDevice(String prefix) {
         if (!initialized || provisionManager == null) {
@@ -229,16 +279,25 @@ public class RdbbBleEspProvisioningModule extends UniModule {
 
         devicePrefix = prefix == null ? "" : prefix.trim();
 
+        // 权限检查
         int permissionCode = requestPermissionsIfNeeded(ACTION_SCAN, prefix);
         if (permissionCode != CODE_SUCCESS) {
             emitCode("bleScanListenerCodeState", permissionCode);
             return permissionCode;
         }
 
+        // 蓝牙开启检查
         int bluetoothCode = ensureBluetoothEnabled(ACTION_SCAN, prefix);
         if (bluetoothCode != CODE_SUCCESS) {
             emitCode("bleScanListenerCodeState", bluetoothCode);
             return bluetoothCode;
+        }
+
+        // 位置服务检查（Android 12 以下必须开）
+        int locationCode = ensureLocationEnabledForBleScan();
+        if (locationCode != CODE_SUCCESS) {
+            emitCode("bleScanListenerCodeState", locationCode, simpleEvent("message", "location service disabled"));
+            return locationCode;
         }
 
         BluetoothAdapter adapter = getBluetoothAdapter();
@@ -261,10 +320,12 @@ public class RdbbBleEspProvisioningModule extends UniModule {
             return CODE_BLE_NOT_SUPPORTED;
         }
 
+        // 停止之前的扫描，清空缓存
         stopScanInternal(false);
         scannedResults.clear();
         scanner = leScanner;
 
+        // BLE 扫描回调
         scanCallback = new ScanCallback() {
             @Override
             public void onScanResult(int callbackType, ScanResult result) {
@@ -282,27 +343,30 @@ public class RdbbBleEspProvisioningModule extends UniModule {
             @Override
             public void onScanFailed(int errorCode) {
                 stopScanInternal(false);
-                emitCode("bleScanListenerCodeState", errorCode, simpleEvent("message", "scan failed"));
+                JSONObject obj = simpleEvent("message", "scan failed");
+                put(obj, "androidScanErrorCode", errorCode);
+                emitCode("bleScanListenerCodeState", CODE_PARAM_ERROR, obj);
             }
         };
 
         try {
             List<ScanFilter> filters = buildScanFilters();
             ScanSettings settings = new ScanSettings.Builder()
-                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY) // 低延迟扫描
                     .build();
 
             if (filters.isEmpty()) {
-                scanner.startScan(scanCallback);
+                scanner.startScan(null, settings, scanCallback);
             } else {
                 scanner.startScan(filters, settings, scanCallback);
             }
 
             scanning = true;
+            // 扫描超时自动停止
             mainHandler.removeCallbacks(scanTimeoutRunnable);
             mainHandler.postDelayed(scanTimeoutRunnable, scanTimeoutMs);
 
-            emitCode("bleScanListenerCodeState", 100, simpleEvent("message", "scan started"));
+            emitCode("bleScanListenerCodeState", EVENT_SCAN_STARTED, simpleEvent("message", "scan started"));
             return CODE_SUCCESS;
         } catch (SecurityException e) {
             int code = permissionCodeByAndroidVersion();
@@ -314,12 +378,19 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         }
     }
 
+    /**
+     * 停止搜索设备
+     */
     @UniJSMethod(uiThread = true)
     public int bleStopSearchDevice() {
         stopScanInternal(true);
-        return CODE_SCAN_STOPPED;
+        return CODE_SUCCESS;
     }
 
+    /**
+     * 连接指定 ESP 设备
+     * @param data 包含设备信息、密钥、UUID 等
+     */
     @UniJSMethod(uiThread = true)
     public int bleConnectDevice(JSONObject data) {
         if (!initialized || provisionManager == null) {
@@ -354,12 +425,14 @@ public class RdbbBleEspProvisioningModule extends UniModule {
             return CODE_PARAM_ERROR;
         }
 
+        // 从扫描缓存中获取设备
         ScanResult scanResult = scannedResults.get(address);
         if (scanResult == null || scanResult.getDevice() == null) {
             emitCode("bleConnectCodeState", CODE_PARAM_ERROR, simpleEvent("message", "ScanResult not found. Please scan again."));
             return CODE_PARAM_ERROR;
         }
 
+        // 权限 + 蓝牙检查
         int permissionCode = requestPermissionsIfNeeded(ACTION_CONNECT, data);
         if (permissionCode != CODE_SUCCESS) {
             emitCode("bleConnectCodeState", permissionCode);
@@ -374,6 +447,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
 
         stopScanInternal(false);
 
+        // 读取连接参数
         securityType = normalizeSecurityType(getInt(data, "securityType", securityType));
         pop = getString(data, "pop", pop);
 
@@ -405,22 +479,30 @@ public class RdbbBleEspProvisioningModule extends UniModule {
             return CODE_PARAM_ERROR;
         }
 
+        // 超时与重试配置
         connectTimeoutMs = sanitizeTimeout(getInt(data, "connectTimeoutMs", connectTimeoutMs), DEFAULT_CONNECT_TIMEOUT_MS);
         sessionTimeoutMs = sanitizeTimeout(getInt(data, "sessionTimeoutMs", sessionTimeoutMs), DEFAULT_SESSION_TIMEOUT_MS);
         retryDelayMs = sanitizeTimeout(getInt(data, "retryDelayMs", retryDelayMs), DEFAULT_RETRY_DELAY_MS);
         connectRetriesRemaining = sanitizeRetryCount(getInt(data, "maxConnectRetries", DEFAULT_MAX_CONNECT_RETRIES));
         sessionRetriesRemaining = sanitizeRetryCount(getInt(data, "maxSessionRetries", DEFAULT_MAX_SESSION_RETRIES));
 
+        // 重置连接状态
         connectAttempt = 0;
         sessionAttempt = 0;
         connected = false;
         sessionInitialized = false;
+        sessionInitializing = false;
+        ignoreNextDisconnectEvent = false;
         disconnectReason = "remote";
 
+        // 开始连接
         startConnectAttempt(scanResult);
         return CODE_SUCCESS;
     }
 
+    /**
+     * 让已连接的 ESP 设备扫描周边 WiFi
+     */
     @UniJSMethod(uiThread = true)
     public int bleScanNetworks() {
         if (!initialized || provisionManager == null) {
@@ -450,8 +532,9 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         }
 
         try {
-            emitCode("wifiList", 100, simpleEvent("message", "wifi scan started"));
+            emitCode("wifiList", EVENT_WIFI_SCAN_START, simpleEvent("message", "wifi scan started"));
 
+            // 调用 ESP 设备 SDK 扫描 WiFi
             espDevice.scanNetworks(new WiFiScanListener() {
                 @Override
                 public void onWifiListReceived(ArrayList<WiFiAccessPoint> list) {
@@ -461,10 +544,12 @@ public class RdbbBleEspProvisioningModule extends UniModule {
                         for (WiFiAccessPoint ap : list) {
                             JSONObject item = new JSONObject();
                             String wifiName = ap == null ? "" : ap.getWifiName();
+
                             put(item, "wifiName", wifiName);
                             put(item, "ssid", wifiName);
                             put(item, "rssi", ap == null ? 0 : ap.getRssi());
                             put(item, "security", ap == null ? 0 : ap.getSecurity());
+
                             wifiList.add(item);
                         }
                     }
@@ -472,22 +557,26 @@ public class RdbbBleEspProvisioningModule extends UniModule {
                     JSONObject event = new JSONObject();
                     put(event, "wifiList", wifiList);
                     put(event, "message", "wifi list received");
-                    emitCode("wifiList", 1, event);
+
+                    emitCode("wifiList", EVENT_WIFI_LIST, event);
                 }
 
                 @Override
                 public void onWiFiScanFailed(Exception e) {
-                    emitCode("wifiList", 2, messageEvent(e));
+                    emitCode("wifiList", EVENT_WIFI_SCAN_FAILED, messageEvent(e));
                 }
             });
 
             return CODE_SUCCESS;
         } catch (Exception e) {
-            emitCode("wifiList", 2, messageEvent(e));
+            emitCode("wifiList", EVENT_WIFI_SCAN_FAILED, messageEvent(e));
             return CODE_PARAM_ERROR;
         }
     }
 
+    /**
+     * 开始配网：下发 WiFi 账号密码给 ESP 设备
+     */
     @UniJSMethod(uiThread = true)
     public int bleStartProvisioning(JSONObject data) {
         if (!initialized || provisionManager == null) {
@@ -521,6 +610,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
             return permissionCode;
         }
 
+        // 获取 WiFi 信息
         String wifiName = firstNonEmpty(
                 getString(data, "wifiName", ""),
                 getString(data, "ssid", "")
@@ -542,39 +632,41 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         provisioning = true;
         long taskId = ++provisionTaskId;
 
+        // 配网超时
         mainHandler.removeCallbacks(provisionTimeoutRunnable);
         mainHandler.postDelayed(provisionTimeoutRunnable, provisionTimeoutMs);
 
         try {
+            // 执行配网
             espDevice.provision(wifiName, password, new ProvisionListener() {
                 @Override
                 public void createSessionFailed(Exception e) {
                     if (!isCurrentProvisionTask(taskId)) return;
-                    finishProvisionFailure(10, e);
+                    finishProvisionFailure(EVENT_PROVISION_FAILED, e);
                 }
 
                 @Override
                 public void wifiConfigSent() {
                     if (!isCurrentProvisionTask(taskId)) return;
-                    emitCode("provisioningCodeState", 100, simpleEvent("message", "wifi config sent"));
+                    emitCode("provisioningCodeState", EVENT_PROVISION_RUNNING, simpleEvent("message", "wifi config sent"));
                 }
 
                 @Override
                 public void wifiConfigFailed(Exception e) {
                     if (!isCurrentProvisionTask(taskId)) return;
-                    finishProvisionFailure(10, e);
+                    finishProvisionFailure(EVENT_PROVISION_FAILED, e);
                 }
 
                 @Override
                 public void wifiConfigApplied() {
                     if (!isCurrentProvisionTask(taskId)) return;
-                    emitCode("provisioningCodeState", 101, simpleEvent("message", "wifi config applied"));
+                    emitCode("provisioningCodeState", EVENT_PROVISION_APPLIED, simpleEvent("message", "wifi config applied"));
                 }
 
                 @Override
                 public void wifiConfigApplyFailed(Exception e) {
                     if (!isCurrentProvisionTask(taskId)) return;
-                    finishProvisionFailure(10, e);
+                    finishProvisionFailure(EVENT_PROVISION_FAILED, e);
                 }
 
                 @Override
@@ -585,6 +677,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
                     JSONObject event = new JSONObject();
                     put(event, "reason", String.valueOf(reason));
                     put(event, "message", String.valueOf(reason));
+
                     finishProvisionFailure(codeState, event);
                 }
 
@@ -597,13 +690,16 @@ public class RdbbBleEspProvisioningModule extends UniModule {
 
                     JSONObject event = new JSONObject();
                     put(event, "wifiName", wifiName);
+                    put(event, "ssid", wifiName);
                     put(event, "message", "provision success");
-                    emitCode("provisioningCodeState", 0, event);
 
+                    emitCode("provisioningCodeState", EVENT_PROVISION_SUCCESS, event);
+
+                    // 配网成功后自动断开
                     if (autoDisconnectAfterProvision) {
                         mainHandler.postDelayed(() -> {
                             disconnectReason = "provisionSuccess";
-                            disconnectQuietly();
+                            disconnectQuietly(false);
                         }, 800);
                     }
                 }
@@ -611,24 +707,30 @@ public class RdbbBleEspProvisioningModule extends UniModule {
                 @Override
                 public void onProvisioningFailed(Exception e) {
                     if (!isCurrentProvisionTask(taskId)) return;
-                    finishProvisionFailure(10, e);
+                    finishProvisionFailure(EVENT_PROVISION_FAILED, e);
                 }
             });
 
             return CODE_SUCCESS;
         } catch (Exception e) {
-            finishProvisionFailure(10, e);
+            finishProvisionFailure(EVENT_PROVISION_FAILED, e);
             return CODE_PARAM_ERROR;
         }
     }
 
+    /**
+     * 停止配网
+     */
     @UniJSMethod(uiThread = true)
     public int bleStopProvisioning() {
         clearProvisionState();
-        emitCode("provisioningCodeState", 3, simpleEvent("message", "provision stopped"));
+        emitCode("provisioningCodeState", EVENT_PROVISION_STOPPED, simpleEvent("message", "provision stopped"));
         return CODE_SUCCESS;
     }
 
+    /**
+     * 断开设备连接
+     */
     @UniJSMethod(uiThread = true)
     public int bleStopDisconnectDevice() {
         disconnectReason = "user";
@@ -637,7 +739,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         clearSessionTimers();
         clearProvisionState();
 
-        disconnectQuietly();
+        disconnectQuietly(false);
 
         connected = false;
         sessionInitialized = false;
@@ -645,40 +747,53 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         sessionInitializing = false;
         espDevice = null;
 
-        emitCode("bleConnectCodeState", 3, simpleEvent("reason", "user"));
+        emitCode("bleConnectCodeState", EVENT_DISCONNECTED, simpleEvent("reason", "user"));
         return CODE_SUCCESS;
     }
 
+    // ==================== 设备连接事件监听 ====================
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void onDeviceConnectionEvent(DeviceConnectionEvent event) {
         if (event == null) return;
 
         int eventType = event.getEventType();
 
+        // 设备连接成功
         if (eventType == ESPConstants.EVENT_DEVICE_CONNECTED) {
             clearConnectTimers();
 
             connecting = false;
             connected = true;
             sessionInitialized = false;
+            ignoreNextDisconnectEvent = false;
 
             JSONObject obj = new JSONObject();
             put(obj, "name", connectedName);
             put(obj, "address", connectedAddress);
             put(obj, "primaryServiceUuid", connectedServiceUuid);
+            put(obj, "serviceUuid", connectedServiceUuid);
             put(obj, "message", "ble connected");
-            emitCode("bleConnectCodeState", 1, obj);
 
+            emitCode("bleConnectCodeState", EVENT_CONNECTED, obj);
+
+            // 连接成功 → 自动开始加密会话
             startSessionAttempt();
             return;
         }
 
+        // 连接失败
         if (eventType == ESPConstants.EVENT_DEVICE_CONNECTION_FAILED) {
             handleConnectFailure(true);
             return;
         }
 
+        // 设备断开连接
         if (eventType == ESPConstants.EVENT_DEVICE_DISCONNECTED) {
+            if (ignoreNextDisconnectEvent) {
+                ignoreNextDisconnectEvent = false;
+                return;
+            }
+
             clearConnectTimers();
             clearSessionTimers();
             clearProvisionState();
@@ -691,12 +806,13 @@ public class RdbbBleEspProvisioningModule extends UniModule {
             JSONObject eventObj = new JSONObject();
             put(eventObj, "reason", disconnectReason);
             put(eventObj, "message", "ble disconnected");
-            emitCode("bleConnectCodeState", 3, eventObj);
 
+            emitCode("bleConnectCodeState", EVENT_DISCONNECTED, eventObj);
             disconnectReason = "remote";
         }
     }
 
+    // ==================== 生命周期 ====================
     @Override
     public void onActivityPause() {
         stopScanInternal(false);
@@ -709,16 +825,17 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         super.onActivityDestroy();
     }
 
+    // ==================== 权限与蓝牙开启结果 ====================
     @Override
     public void onActivityResult(int requestCode, int resultCode, Intent data) {
         if (requestCode == REQUEST_CODE_ENABLE_BLUETOOTH) {
             if (resultCode == Activity.RESULT_OK) {
                 emitState("blePermissions", true);
-                emitCode("bleEnvironmentInit", CODE_SUCCESS, simpleEvent("message", "bluetooth enabled"));
+                emitCode(tagByAction(pendingAction), CODE_SUCCESS, simpleEvent("message", "bluetooth enabled"));
                 resumePendingAction();
             } else {
                 emitState("blePermissions", false);
-                emitCode("bleEnvironmentInit", CODE_BLE_NEED_ENABLE, simpleEvent("message", "bluetooth disabled"));
+                emitCode(tagByAction(pendingAction), CODE_BLE_NEED_ENABLE, simpleEvent("message", "bluetooth disabled"));
                 clearPendingAction();
             }
         }
@@ -729,6 +846,8 @@ public class RdbbBleEspProvisioningModule extends UniModule {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         if (requestCode == REQUEST_CODE_PERMISSIONS) {
+            String eventTag = tagByAction(pendingAction);
+
             if (allPermissionsGranted(grantResults)) {
                 emitState(permissionEventTag(), true);
 
@@ -739,7 +858,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
                 resumePendingAction();
             } else {
                 emitState(permissionEventTag(), false);
-                emitCode("bleEnvironmentInit", permissionDeniedCode(), simpleEvent("message", "permission denied"));
+                emitCode(eventTag, permissionDeniedCode(), simpleEvent("message", "permission denied"));
                 clearPendingAction();
             }
         }
@@ -747,6 +866,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
     }
 
+    // ==================== 配置更新 ====================
     private int updateConfig(JSONObject options) {
         securityType = normalizeSecurityType(getInt(options, "securityType", securityType));
         pop = getString(options, "pop", pop);
@@ -770,6 +890,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         return CODE_SUCCESS;
     }
 
+    // ==================== 扫描过滤构建 ====================
     private List<ScanFilter> buildScanFilters() {
         List<ScanFilter> filters = new ArrayList<>();
 
@@ -782,12 +903,16 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         return filters;
     }
 
+    /**
+     * 处理扫描到的 BLE 设备
+     */
     private void handleScanResult(ScanResult result) {
         if (result == null || result.getDevice() == null) return;
 
         String name = resolveDeviceName(result);
         if (name == null) name = "";
 
+        // 名称前缀过滤
         if (devicePrefix.length() > 0 && !name.startsWith(devicePrefix)) return;
 
         String address;
@@ -804,6 +929,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
 
         String serviceUuid = resolvePrimaryServiceUuid(result);
 
+        // 封装设备信息发给前端
         JSONObject device = new JSONObject();
         put(device, "name", name.length() > 0 ? name : "未命名设备");
         put(device, "deviceName", name.length() > 0 ? name : "未命名设备");
@@ -814,9 +940,11 @@ public class RdbbBleEspProvisioningModule extends UniModule {
 
         JSONObject event = new JSONObject();
         put(event, "mBleDevice", device);
+
         emitRaw(eventWithTag("mBleDevice", event));
     }
 
+    // ==================== 连接、会话、配网核心逻辑 ====================
     private void startConnectAttempt(ScanResult scanResult) {
         if (scanResult == null || scanResult.getDevice() == null) {
             finishConnectFailure("Invalid ScanResult.");
@@ -829,8 +957,9 @@ public class RdbbBleEspProvisioningModule extends UniModule {
             clearProvisionState();
 
             disconnectReason = "reconnect";
-            disconnectQuietly();
+            disconnectQuietly(true);
 
+            // 创建 ESP 设备对象
             ESPConstants.SecurityType sec = securityType == 0
                     ? ESPConstants.SecurityType.SECURITY_0
                     : ESPConstants.SecurityType.SECURITY_1;
@@ -852,6 +981,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
 
             connecting = true;
             connected = false;
+            sessionInitializing = false;
             sessionInitialized = false;
             connectAttempt++;
 
@@ -860,10 +990,16 @@ public class RdbbBleEspProvisioningModule extends UniModule {
             put(event, "name", connectedName);
             put(event, "address", connectedAddress);
             put(event, "primaryServiceUuid", connectedServiceUuid);
+            put(event, "serviceUuid", connectedServiceUuid);
+            put(event, "securityType", securityType);
             put(event, "message", "connecting");
-            emitCode("bleConnectCodeState", 100, event);
+
+            emitCode("bleConnectCodeState", EVENT_CONNECTING, event);
 
             disconnectReason = "remote";
+            ignoreNextDisconnectEvent = false;
+
+            // 执行 BLE 连接
             espDevice.connectBLEDevice(scanResult.getDevice(), connectedServiceUuid);
 
             mainHandler.postDelayed(connectTimeoutRunnable, connectTimeoutMs);
@@ -874,9 +1010,12 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         }
     }
 
+    /**
+     * 连接成功后，建立加密会话
+     */
     private void startSessionAttempt() {
         if (!connected || espDevice == null) {
-            emitCode("initSessionCodeState", 2, simpleEvent("message", "Device is not connected."));
+            emitCode("initSessionCodeState", EVENT_SESSION_FAILED, simpleEvent("message", "Device is not connected."));
             return;
         }
 
@@ -889,7 +1028,8 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         JSONObject startEvent = new JSONObject();
         put(startEvent, "attempt", sessionAttempt);
         put(startEvent, "message", "session initializing");
-        emitCode("initSessionCodeState", 100, startEvent);
+
+        emitCode("initSessionCodeState", EVENT_SESSION_START, startEvent);
 
         try {
             espDevice.initSession(new ResponseListener() {
@@ -900,7 +1040,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
                     sessionInitializing = false;
                     sessionInitialized = true;
 
-                    emitCode("initSessionCodeState", 1, simpleEvent("message", "session success"));
+                    emitCode("initSessionCodeState", EVENT_SESSION_SUCCESS, simpleEvent("message", "session success"));
                 }
 
                 @Override
@@ -915,16 +1055,26 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         }
     }
 
+    /**
+     * 连接失败处理（支持重试）
+     */
     private void handleConnectFailure(boolean retryable) {
         clearConnectTimers();
 
         connected = false;
+        sessionInitializing = false;
         sessionInitialized = false;
 
         if (retryable && connectRetriesRemaining > 0) {
             connectRetriesRemaining--;
 
             ScanResult retryResult = scannedResults.get(connectedAddress);
+
+            JSONObject event = new JSONObject();
+            put(event, "message", "connect failed, retrying");
+            put(event, "remainingRetries", connectRetriesRemaining);
+            emitCode("bleConnectCodeState", EVENT_CONNECTING, event);
+
             pendingConnectRetryRunnable = () -> startConnectAttempt(retryResult);
             mainHandler.postDelayed(pendingConnectRetryRunnable, retryDelayMs);
             return;
@@ -943,12 +1093,15 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         sessionInitialized = false;
 
         disconnectReason = "connectFailed";
-        disconnectQuietly();
+        disconnectQuietly(true);
         espDevice = null;
 
-        emitCode("bleConnectCodeState", 2, simpleEvent("message", message));
+        emitCode("bleConnectCodeState", EVENT_CONNECT_FAILED, simpleEvent("message", message));
     }
 
+    /**
+     * 会话初始化失败（支持重试）
+     */
     private void handleSessionFailure(boolean retryable, Exception e) {
         clearSessionTimers();
 
@@ -956,6 +1109,11 @@ public class RdbbBleEspProvisioningModule extends UniModule {
 
         if (retryable && sessionRetriesRemaining > 0) {
             sessionRetriesRemaining--;
+
+            JSONObject event = new JSONObject();
+            put(event, "message", "session failed, retrying");
+            put(event, "remainingRetries", sessionRetriesRemaining);
+            emitCode("initSessionCodeState", EVENT_SESSION_START, event);
 
             pendingSessionRetryRunnable = this::startSessionAttempt;
             mainHandler.postDelayed(pendingSessionRetryRunnable, retryDelayMs);
@@ -967,10 +1125,11 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         JSONObject event = new JSONObject();
         put(event, "message", safeMessage(e));
         put(event, "needReconnect", true);
-        emitCode("initSessionCodeState", 2, event);
+
+        emitCode("initSessionCodeState", EVENT_SESSION_FAILED, event);
 
         disconnectReason = "sessionFailed";
-        disconnectQuietly();
+        disconnectQuietly(true);
 
         connected = false;
         sessionInitialized = false;
@@ -981,6 +1140,9 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         handleSessionFailure(retryable, new Exception("Session timeout."));
     }
 
+    /**
+     * 配网失败统一处理
+     */
     private void finishProvisionFailure(int codeState, Exception e) {
         finishProvisionFailure(codeState, messageEvent(e));
     }
@@ -992,17 +1154,31 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         emitCode("provisioningCodeState", codeState, event);
     }
 
+    /**
+     * 校验是否是当前配网任务（防止并发）
+     */
     private boolean isCurrentProvisionTask(long taskId) {
         return provisioning && taskId == provisionTaskId;
     }
 
+    /**
+     * 映射 ESP 设备返回的配网失败原因
+     */
     private int mapProvisionFailure(ESPConstants.ProvisionFailureReason reason) {
-        if (reason == null) return 10;
-        if (reason == ESPConstants.ProvisionFailureReason.AUTH_FAILED) return 1;
-        if (reason == ESPConstants.ProvisionFailureReason.NETWORK_NOT_FOUND) return 2;
-        return 10;
+        if (reason == null) return EVENT_PROVISION_FAILED;
+
+        if (reason == ESPConstants.ProvisionFailureReason.AUTH_FAILED) {
+            return EVENT_PROVISION_AUTH_FAILED;
+        }
+
+        if (reason == ESPConstants.ProvisionFailureReason.NETWORK_NOT_FOUND) {
+            return EVENT_PROVISION_NETWORK_NOT_FOUND;
+        }
+
+        return EVENT_PROVISION_FAILED;
     }
 
+    // ==================== 超时回调 ====================
     private void onScanTimeout() {
         if (!scanning) return;
 
@@ -1011,7 +1187,8 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         JSONObject obj = new JSONObject();
         put(obj, "count", scannedResults.size());
         put(obj, "message", "scan timeout");
-        emitCode("bleScanListenerCodeState", 0, obj);
+
+        emitCode("bleScanListenerCodeState", EVENT_SCAN_FINISHED, obj);
     }
 
     private void onConnectTimeout() {
@@ -1033,9 +1210,11 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         JSONObject event = new JSONObject();
         put(event, "message", "Provision timeout.");
         put(event, "timeoutMs", provisionTimeoutMs);
-        emitCode("provisioningCodeState", 10, event);
+
+        emitCode("provisioningCodeState", EVENT_PROVISION_FAILED, event);
     }
 
+    // ==================== 权限、蓝牙、位置服务 ====================
     private int requestPermissionsIfNeeded(int action, Object data) {
         String[] missing = getMissingPermissions(action);
         if (missing.length == 0) return CODE_SUCCESS;
@@ -1059,6 +1238,11 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         }
     }
 
+    /**
+     * 根据 Android 版本获取缺失权限
+     * Android 12+：BLUETOOTH_SCAN / CONNECT
+     * 旧版本：ACCESS_FINE_LOCATION
+     */
     private String[] getMissingPermissions(int action) {
         if (appContext == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
             return new String[0];
@@ -1090,6 +1274,9 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         return permissions.toArray(new String[0]);
     }
 
+    /**
+     * 确保蓝牙已开启
+     */
     private int ensureBluetoothEnabled(int action, Object data) {
         BluetoothAdapter adapter = getBluetoothAdapter();
         if (adapter == null) return CODE_BLE_NOT_SUPPORTED;
@@ -1102,6 +1289,29 @@ public class RdbbBleEspProvisioningModule extends UniModule {
 
         requestEnableBluetooth(action, data);
         return CODE_BLE_NEED_ENABLE;
+    }
+
+    /**
+     * 确保位置开启（Android 12 以下 BLE 扫描必须）
+     */
+    private int ensureLocationEnabledForBleScan() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            return CODE_SUCCESS;
+        }
+
+        if (appContext == null) return CODE_SUCCESS;
+
+        try {
+            LocationManager manager = (LocationManager) appContext.getSystemService(Context.LOCATION_SERVICE);
+            if (manager == null) return CODE_LOCATION_DISABLED;
+
+            boolean gpsEnabled = manager.isProviderEnabled(LocationManager.GPS_PROVIDER);
+            boolean networkEnabled = manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
+
+            return gpsEnabled || networkEnabled ? CODE_SUCCESS : CODE_LOCATION_DISABLED;
+        } catch (Exception e) {
+            return CODE_LOCATION_DISABLED;
+        }
     }
 
     private void requestEnableBluetooth(int action, Object data) {
@@ -1128,6 +1338,9 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         }
     }
 
+    /**
+     * 权限/蓝牙开启后，恢复之前的动作
+     */
     private void resumePendingAction() {
         int action = pendingAction;
         Object data = pendingActionData;
@@ -1150,6 +1363,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         pendingActionData = null;
     }
 
+    // ==================== 内部停止/断开/释放 ====================
     private void stopScanInternal(boolean emitStop) {
         mainHandler.removeCallbacks(scanTimeoutRunnable);
 
@@ -1170,19 +1384,27 @@ public class RdbbBleEspProvisioningModule extends UniModule {
             JSONObject obj = new JSONObject();
             put(obj, "count", scannedResults.size());
             put(obj, "message", "scan stopped");
-            emitCode("bleScanListenerCodeState", 0, obj);
+
+            emitCode("bleScanListenerCodeState", EVENT_SCAN_FINISHED, obj);
         }
     }
 
-    private void disconnectQuietly() {
+    /**
+     * 安静断开，不抛异常
+     */
+    private void disconnectQuietly(boolean ignoreEvent) {
         try {
             if (espDevice != null) {
+                ignoreNextDisconnectEvent = ignoreEvent;
                 espDevice.disconnectDevice();
             }
         } catch (Exception ignored) {
         }
     }
 
+    /**
+     * 释放所有资源
+     */
     private void releaseAll(boolean unregisterEventBus) {
         stopScanInternal(false);
 
@@ -1194,7 +1416,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         mainHandler.removeCallbacksAndMessages(null);
 
         disconnectReason = "release";
-        disconnectQuietly();
+        disconnectQuietly(true);
 
         if (unregisterEventBus && EventBus.getDefault().isRegistered(this)) {
             EventBus.getDefault().unregister(this);
@@ -1214,6 +1436,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         sessionInitializing = false;
         sessionInitialized = false;
         provisioning = false;
+        ignoreNextDisconnectEvent = false;
 
         connectedAddress = "";
         connectedName = "";
@@ -1244,6 +1467,7 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         provisionTaskId++;
     }
 
+    // ==================== 工具方法 ====================
     private BluetoothAdapter getBluetoothAdapter() {
         if (appContext == null) return null;
 
@@ -1329,6 +1553,14 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         return Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                 ? CODE_BLE_PERMISSION_REQUIRED
                 : CODE_LOCATION_PERMISSION_DENIED;
+    }
+
+    private String tagByAction(int action) {
+        if (action == ACTION_SCAN) return "bleScanListenerCodeState";
+        if (action == ACTION_CONNECT) return "bleConnectCodeState";
+        if (action == ACTION_SCAN_WIFI) return "wifiList";
+        if (action == ACTION_PROVISION) return "provisioningCodeState";
+        return "bleEnvironmentInit";
     }
 
     private void refreshContext() {
@@ -1432,6 +1664,9 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         emitCode(tag, code, null);
     }
 
+    /**
+     * 向前端发送带状态码的事件
+     */
     private void emitCode(String tag, int code, JSONObject extra) {
         JSONObject obj = new JSONObject();
 
@@ -1455,6 +1690,9 @@ public class RdbbBleEspProvisioningModule extends UniModule {
         emitRaw(obj);
     }
 
+    /**
+     * 触发 uni-app 全局事件，给前端回调
+     */
     private void emitRaw(JSONObject obj) {
         try {
             if (mUniSDKInstance != null) {
