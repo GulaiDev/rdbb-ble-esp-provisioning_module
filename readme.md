@@ -31,7 +31,8 @@ init -> searchESPDevices -> connect -> initializeSession -> scanWifiList -> prov
 uni-app 页面中获取模块：
 
 ```js
-const esp = weex.requireModule('rdbb-ble-esp-provisioning_module')
+const espModule = uni.requireNativePlugin('nw-ble-esp-provisioning_module')
+const globalEvent = uni.requireNativePlugin('globalEvent')
 ```
 
 ## Android 权限
