@@ -1,0 +1,22 @@
+{
+	"name": "rdbb-ble-esp-provisioning_module",
+	"id": "rdbb-ble-esp-provisioning_module",
+	"version": "1.0.0",
+	"description": "ESP BLE Provisioning 原生插件 Android 调试版",
+	"_dp_type": "nativeplugin",
+	"_dp_nativeplugin": {
+		"android": {
+			"plugins": [{
+				"type": "module",
+				"name": "rdbb-ble-esp-provisioning_module",
+				"class": "com.rdbb.esp.RdbbBleEspProvisioningModule"
+			}],
+			"integrateType": "aar",
+			"dependencies": [
+				"com.github.espressif:esp-idf-provisioning-android:lib-2.2.3",
+				"org.greenrobot:eventbus:3.3.1"
+			]
+		}
+	}
+
+}
